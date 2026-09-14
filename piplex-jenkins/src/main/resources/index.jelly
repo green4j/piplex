@@ -1,0 +1,6 @@
+<?jelly escape-by-default='true'?>
+<div>
+  Decides which Jenkins controller is allowed to run a job, and lets a pipeline on one controller start
+  because a pipeline on another finished. State is kept in a coordination store shared by every
+  controller, not in each controller's own job configuration.
+</div>

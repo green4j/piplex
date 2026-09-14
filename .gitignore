@@ -1,0 +1,10 @@
+.gradle/
+
+build/
+.nb-gradle/
+
+.idea
+out/
+
+# the dev controller's JENKINS_HOME, made by :piplex-jenkins:server
+work/

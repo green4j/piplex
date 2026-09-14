@@ -1,0 +1,46 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
+  <f:section title="piplex">
+    <f:entry title="This controller's id" field="ownerId"
+             description="What a designation names this controller, e.g. euc1-blue. It must differ from every other controller's, and it must not change: it is what decides which of them runs the work.">
+      <f:textbox/>
+    </f:entry>
+    <f:entry title="discas client id" field="clientId"
+             description="The identity this controller connects to discas under. Leave empty to use the controller's id. One identity per controller, so that access rules and the store's own audit can tell them apart.">
+      <f:textbox/>
+    </f:entry>
+    <f:entry title="discas nodes" field="nodes"
+             description="One nodeId=host:port per line, for every node of the cluster.">
+      <f:textarea/>
+    </f:entry>
+
+    <f:entry title="Watch poll period" field="watchPollPeriod"
+             description="How long a watch waits between polls, e.g. 30s or 2m. A watch in discas is a poll, not a subscription, and every poll of every watch is a consensus round. Leave empty for the discas client's own setting, which polls every second: right for work that changes by the minute, far more than a nightly job needs. At least 500ms.">
+      <f:textbox/>
+    </f:entry>
+
+    <f:entry title="Shared token" field="token"
+             description="The token a cluster running --client-auth token expects. Leave empty for a cluster in allowall or mtls mode. A token says the caller is one of us, not which one, so it is not a substitute for a client certificate. Tick 'Connect over TLS' as well, or it crosses the wire in clear.">
+      <f:password/>
+    </f:entry>
+
+    <f:optionalBlock title="Connect over TLS" field="tls" inline="true">
+      <f:entry title="Trust store (PKCS12)" field="tlsTruststore"
+               description="A file on this controller holding the CA that signed the nodes' client-port certificates, e.g. /etc/discas/tls/client-ca.p12. Leave empty to trust the JVM's own store, which is right only where a public CA signed them.">
+        <f:textbox/>
+      </f:entry>
+      <f:entry title="Trust store password" field="tlsTruststorePassword"
+               description="Leave empty if the trust store has none. Most hold public certificates and do not.">
+        <f:password/>
+      </f:entry>
+      <f:entry title="Key store (PKCS12)" field="tlsKeystore"
+               description="A file on this controller holding its own client certificate and private key, e.g. /etc/discas/tls/euc1-blue.p12. Required by a cluster running --client-auth mtls, where the certificate's subject is the client id and the id typed in above is ignored. Leave empty to present no certificate, which is enough only with a token.">
+        <f:textbox/>
+      </f:entry>
+      <f:entry title="Key store password" field="tlsKeystorePassword"
+               description="Opens the key store, and is taken as the private key's password too.">
+        <f:password/>
+      </f:entry>
+    </f:optionalBlock>
+  </f:section>
+</j:jelly>
