@@ -1,116 +1,72 @@
 ## 3. Milestones
 
-Two questions: how far did the producer get, and how do I wait until it got far enough.
+A milestone records the highest generation a producer completed. Consumers wait for state, not for an
+event, so they remain correct after missed changes and restarts.
 
-This is what makes a pipeline on one controller start because a pipeline on another finished. Neither
-knows the other exists, and no schedule has to guess how long the first one takes.
+### Publish
 
-Source: [`Milestones`](../piplex-core/src/main/java/io/github/green4j/piplex/milestone/Milestones.java).
-
-### The picture
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant P as producer euc1-blue
-    participant S as piplex/milestone/data/euc1
-    participant C1 as consumer reporting
-    participant C2 as consumer risk
-
-    C1->>S: awaitAtLeast 2026-09-12
-    C2->>S: awaitAtLeast 2026-09-12
-    Note over C1,C2: parked. no executor held
-
-    Note over P: runs the work
-    P->>S: publish 2026-09-12 (on success only)
-
-    S-->>C1: changed
-    S-->>C2: changed
-    C1->>S: read: 2026-09-12
-    C2->>S: read: 2026-09-12
-    Note over C1,C2: both proceed
+```java
+milestones.publish("data/euc1", Generation.of("2026-09-14"),
+        "euc1-blue", "eod#142");
 ```
 
-The producer does not know who is waiting. The consumers do not know who produces. Adding a third
-consumer touches nobody's configuration but its own.
+Publishing is:
 
-### Publishing is monotonic and idempotent
+- **monotonic:** an earlier generation cannot replace a later one;
+- **idempotent:** the current generation is a no-op;
+- **version-fenced:** concurrent producers retry compare-and-set and cannot silently overwrite a
+  later value.
 
-```mermaid
-flowchart TD
-    START(["publish(key, generation)"]) --> READ["read the key,<br/>keeping its version"]
-    READ --> CMP{"in force &ge;<br/>generation?"}
-    CMP -- yes --> NOOP(["ALREADY_AT_OR_AHEAD<br/>nothing written"])
-    CMP -- no --> CAS["compareAndSet<br/>on that version"]
-    CAS --> OK{"landed?"}
-    OK -- yes --> PUB(["PUBLISHED"])
-    OK -- no --> LEFT{"attempts left?"}
-    LEFT -- yes --> READ
-    LEFT -- no --> ERR(["ContendedException<br/>after 8 attempts"])
+Call publish only after successful work. A failed or interrupted producer must leave the milestone
+unchanged.
+
+`PublishResult` reports `PUBLISHED` or `ALREADY_AT_OR_AHEAD` and includes the record in force.
+
+### Wait
+
+```java
+AwaitResult result = milestones.awaitAtLeast(
+        "data/euc1", Generation.of("2026-09-14"), Duration.ofMinutes(90));
 ```
 
-Two consequences, and both are why the Jenkins step can simply be re-run:
+The waiter reads, compares, waits for a bounded change, then reads again. It returns:
 
-- re-running a producer for an **earlier** generation is a no-op, not a regression. A milestone never
-  moves backwards.
-- re-running it for the **same** generation costs one read.
+- `REACHED` when the stored generation is at least the requested one;
+- `TIMED_OUT` with the latest record, or `null` if nothing was published.
 
-**Publish on success and only on success.** A producer stopped half way must leave the milestone where
-it was, so that waiters keep waiting rather than proceed on a partial result. A producer that publishes
-on the way out regardless of outcome turns every waiting pipeline into a consumer of half-written days.
+Cancelling the returned future stops the loop within its current one-minute round. A waiter holds no
+state in the store.
 
-### Waiting compares state
+### Ordering
 
-```mermaid
-flowchart TD
-    START(["awaitAtLeast(key, generation, timeout)"]) --> READ["read the key,<br/>keeping its version"]
-    READ --> CMP{"in force &ge;<br/>generation?"}
-    CMP -- yes --> OK(["REACHED"])
-    CMP -- no --> T{"time left?"}
-    T -- no --> TO(["TIMED_OUT<br/>with whatever was in force"])
-    T -- yes --> W["awaitChange since that version,<br/>bounded by what is left"]
-    W --> READ
-```
+Generations are strings ordered lexicographically. Prefer ISO-8601 dates or fixed-width counters.
 
-The waiter holds **no position of its own**. It knows which generation it needs, and it reads the key.
-A controller that restarts mid-wait simply looks again.
+Choose a key for a consumable result, not for a pipeline. If trades and positions can be consumed
+independently, publish separate milestones; if only the combined day is valid, publish one after every
+required branch succeeds.
 
-This is also why nothing anywhere has to remember "the last generation I acted on": the waiter brings
-that with it. That single fact is the reason no consumer-side state exists in piplex at all.
+When an exclusive request uses `completedWhen`, publish before releasing its lease. Use
+`Admitted.completeAndRelease()` in core, put `piplexPublish` inside a scripted exclusive block, or use
+the declarative whole-build pattern described in [Jenkins](05-jenkins.md#completion-order).
 
-`TIMED_OUT` comes back with what *was* in force, so the caller can say "waited for 2026-09-12, it is at
-2026-09-11" rather than only that the wait ended.
+### Record and repair
 
-### The record
+`piplex/milestone/<key>` contains:
 
 ```json
-{
-  "generation": "2026-09-12",
-  "by": "euc1-blue",
-  "runId": "eod #142",
-  "at": "2026-09-12T03:14:07Z"
-}
+{"generation":"2026-09-14","by":"euc1-blue","runId":"eod#142","at":"2026-09-15T02:37:12Z"}
 ```
 
-Only `generation` means anything to piplex. The rest is there so that somebody reading the key can see
-who put it there and when without opening another system.
+Only `generation` affects decisions. The other fields explain the latest write.
 
-`at` comes from the wall clock, which piplex uses for the timestamp in a record and for nothing else.
-It is for a person to read, never for a decision.
+Malformed records fail closed as `UnreadableKeyException`. An operator who knows the correct
+generation may replace one with:
 
-### Choosing a key and a generation
+```java
+milestones.repair("data/euc1", Generation.of("2026-09-14"));
+```
 
-**The key names data, not a job**: `data/euc1`, `positions/eod`, `fx-rates/apac`. A consumer waits for
-the data it needs, and stays right when the job that produces it is renamed, split in two, or moved to
-another controller.
+Repair can move an unreadable milestone to any supplied generation, so derive it from durable evidence
+such as build logs.
 
-**The generation is usually the business date.** It is compared lexicographically, so ISO-8601 is safe
-and a bare counter must be zero-padded. See [the model](01-model.md#generations).
-
-**One milestone per thing.** Where a producer emits several things at different times, give each its own
-milestone rather than one milestone with a compound generation. `awaitAtLeast` compares one string, and
-two facts in one string means neither can be waited for on its own.
-
----
-
-Previous: [2. Exclusive run](02-exclusive-run.md) &middot; Next: [4. Switches](04-switches.md)
+Previous: [2. Exclusive runs](02-exclusive-run.md) · Next: [4. Switches](04-switches.md) · [Documentation index](README.md)

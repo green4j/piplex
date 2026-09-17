@@ -1,0 +1,88 @@
+io.github.green4j.piplex.jenkins.ExclusiveStepExecution
+    serialVersionUID 1
+    admittedToken J
+    bodyEnded Z
+    stateVersion I
+    waitedNanos J
+    body Lorg/jenkinsci/plugins/workflow/steps/BodyExecution;
+    bodyFailure Ljava/lang/Throwable;
+    completedWhen Ljava/lang/String;
+    designatedBy Ljava/lang/String;
+    enabledBy Ljava/lang/String;
+    executionId Ljava/lang/String;
+    generation Ljava/lang/String;
+    guardGrace Ljava/lang/String;
+    handoverWait Ljava/lang/String;
+    key Ljava/lang/String;
+    lease Ljava/lang/String;
+    ownershipId Ljava/lang/String;
+    renewEvery Ljava/lang/String;
+    renewalGrace Ljava/lang/String;
+io.github.green4j.piplex.jenkins.ExclusiveStepExecution$ReleaseOnFinish
+    serialVersionUID 1
+    execution Lio/github/green4j/piplex/jenkins/ExclusiveStepExecution;
+io.github.green4j.piplex.jenkins.NodeIdentity$Kind
+    serialVersionUID 0
+io.github.green4j.piplex.jenkins.PiplexAwaitStep$Execution
+    serialVersionUID 1
+    skipOnTimeout Z
+    generation Ljava/lang/String;
+    key Ljava/lang/String;
+    timeout Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexConfiguration
+    clientId java.lang.String
+    nodes java.lang.String
+    ownerId java.lang.String
+    tls boolean
+    tlsKeystore java.lang.String
+    tlsKeystorePassword hudson.util.Secret
+    tlsTruststore java.lang.String
+    tlsTruststorePassword hudson.util.Secret
+    tlsVerifyNodeIdentity boolean
+    token hudson.util.Secret
+    watchPollPeriod java.lang.String
+io.github.green4j.piplex.jenkins.PiplexConfiguration$InvalidSetting
+    serialVersionUID 1
+    field Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexInterruption$FencedOut
+    serialVersionUID 1
+    had J
+    nowHas J
+    key Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexInterruption$LostOnResume
+    serialVersionUID 1
+    key Ljava/lang/String;
+    why Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexInterruption$MilestoneMissing
+    serialVersionUID 1
+    milestone Ljava/lang/String;
+    reached Ljava/lang/String;
+    wanted Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexInterruption$NotOurs
+    serialVersionUID 1
+    key Ljava/lang/String;
+    why Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexInterruption$Revoked
+    serialVersionUID 1
+    detail Ljava/lang/String;
+    key Ljava/lang/String;
+    newOwner Ljava/lang/String;
+    reason Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexInterruption$UnavailableOnResume
+    serialVersionUID 1
+    key Ljava/lang/String;
+    why Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexInterruption$Unreadable
+    serialVersionUID 1
+    detail Ljava/lang/String;
+    key Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexOwnership
+    serialVersionUID 1
+    id Ljava/lang/String;
+    key Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexPublishStep$Execution
+    serialVersionUID 1
+    generation Ljava/lang/String;
+    key Ljava/lang/String;
+io.github.green4j.piplex.jenkins.PiplexTokenStep$Execution
+    serialVersionUID 1

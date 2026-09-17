@@ -1,6 +1,9 @@
 name: Build
 
 on:
+  # Called by release.yml, so a tag is released only if the same checks that guard main have passed
+  # against the tagged commit.
+  workflow_call:
   workflow_dispatch:
   push:
     branches:
@@ -10,7 +13,7 @@ on:
       - main
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -24,31 +27,54 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: [ '17', '21', '25' ]
+        java: [ '21', '25' ]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Set up JDK ${{ matrix.java }}
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: gradle
 
-      - name: Build
-        run: ./gradlew --no-daemon --stacktrace clean build
+      # The .hpi is packaged here rather than only at release time. `build` does not produce one -- the
+      # jpi task is not wired into it, which is why release.yml names the task -- so without this line
+      # the first run of the packaging is the run that happens after a tag has been pushed, which is the
+      # one moment it is too late to fix.
+      - name: Build and package
+        run: ./gradlew --no-daemon --stacktrace clean build :piplex-jenkins:jpi
 
-  # The baseline is what gradle-build above already covers, and it is the version the .hpi is stamped
-  # with. This says the plugin also still works on the newest LTS, which is the other half of the claim
-  # and the half nothing else checks. It is not a second baseline: the manifest keeps naming the oldest
-  # controller piplex runs on, and raising that is a separate, deliberate decision.
+      # The two manifest entries a controller refuses a plugin on. Both are set by hand in build.gradle
+      # -- Jenkins-Version from the baseline, Minimum-Java-Version because jpi2 would otherwise infer 17
+      # from a toolchain this build deliberately does not pin -- so both are worth reading back out of
+      # the file rather than trusting to have been written.
+      - name: Check what the .hpi says
+        shell: bash
+        run: |
+          hpi="$(ls piplex-jenkins/build/libs/piplex-*.hpi)"
+          echo "Packaged ${hpi}"
+          manifest="$(unzip -p "${hpi}" META-INF/MANIFEST.MF | tr -d '\r')"
+          echo "${manifest}"
+          for entry in Jenkins-Version Minimum-Java-Version Plugin-Version; do
+            if ! grep -q "^${entry}: ." <<<"${manifest}"; then
+              echo "The manifest has no ${entry}"
+              exit 1
+            fi
+          done
+
+  # The baseline is what gradle-build above already covers, on both JDKs, and it is the version the
+  # .hpi is stamped with -- 2.555.1, which is the first LTS to require Java 21 and the first to support
+  # Java 25. This says the plugin also still works on the newest LTS, which is the other half of the
+  # claim and the half nothing else checks. It is not a second baseline: the manifest keeps naming the
+  # oldest controller piplex runs on, and raising that is a separate, deliberate decision.
   #
-  # Only the plugin module, and only the release JDK: the engine and the store adapter have no Jenkins
-  # in them at all -- checkCoreIsHostAgnostic is what keeps that true -- so running them again here
-  # would test nothing a moment longer.
+  # Only the plugin module: the engine and the store adapter have no Jenkins in them at all --
+  # checkCoreIsHostAgnostic is what keeps that true -- so running them again here would test nothing a
+  # moment longer.
   jenkins-lts:
-    name: Jenkins plugin (Jenkins ${{ matrix.jenkins }})
+    name: Jenkins plugin (Jenkins ${{ matrix.jenkins }}, JDK ${{ matrix.java }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -57,15 +83,19 @@ jobs:
         # Only a version the jenkinsLines table in build.gradle knows: the BOM that goes with it comes
         # from there, so one value here selects both and they cannot drift apart.
         jenkins: [ '2.568.3' ]
+        # Both, because the baseline above is only tested on both by gradle-build, and "works on the
+        # newest LTS" is a claim about the Java a controller actually runs today as much as about the
+        # core version.
+        java: [ '21', '25' ]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ matrix.java }}
           cache: gradle
 
       - name: Test the plugin against Jenkins ${{ matrix.jenkins }}

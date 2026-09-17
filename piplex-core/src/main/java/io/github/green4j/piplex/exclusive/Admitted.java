@@ -7,23 +7,17 @@
 
 package io.github.green4j.piplex.exclusive;
 
+import io.github.green4j.piplex.milestone.PublishResult;
+
 import java.util.concurrent.CompletionStage;
 import java.util.function.Consumer;
 
 /**
- * This run may proceed, for as long as this handle says so.
+ * Ownership held by one run until release or revocation.
  *
- * <p>Admission is <b>held, not granted once</b>. The designation is watched for as long as the run
- * lasts, and the lease is renewed underneath it; if either stops being true the handle is revoked and
- * whatever registered with {@link #onRevoked} is told. That is what lets an operator name a new owner
- * while a run is in flight and have the old one actually stop.
- *
- * <p><b>What this does not promise.</b> It promises that at most one holder <i>believes</i> it is the
- * owner. It cannot promise that at most one is still <i>affecting</i> anything: between a lease lapsing
- * and its former holder noticing, both believe it. {@link #fencingToken()} is what closes that gap, and
- * only where the protected resource itself refuses a token lower than the highest it has seen. Where it
- * does not -- which is most places -- call {@link #isHeld()} before each irreversible step and accept
- * that stopping a run half way is not the same as making half-finished work harmless.
+ * <p>The handle renews its lease and watches configured guards. Register {@link #onRevoked} before
+ * starting work, check {@link #isHeld()} before irreversible steps, and pass {@link #fencingToken()} to
+ * resources that can reject stale holders.
  */
 public non-sealed interface Admitted extends Admission {
 
@@ -55,18 +49,57 @@ public non-sealed interface Admitted extends Admission {
      * Registers something to be told when ownership is lost. A listener added after revocation is told
      * at once, so there is no race between starting the work and subscribing to losing it.
      *
+     * <p>Revocation stops the renewals but does not give the lease up: the work may still be running.
+     * Call {@link #release()} once it has actually stopped; left alone, the lease lapses within its
+     * term.
+     *
+     * <p>Listeners are told before the observer, on the same threads and under the same rules as
+     * {@link io.github.green4j.piplex.observe.PiplexObserver}: quickly, without blocking, and with
+     * nothing locked, so {@link #release()} may be called from one. Stopping work that takes a while
+     * is started here, not waited for.
+     *
      * @param listener told once, with why
      */
     void onRevoked(Consumer<Revocation> listener);
 
     /**
-     * Stops renewing and gives the lease up. Idempotent, and safe to call on a revoked handle.
+     * Stops renewing and gives the lease up. Idempotent, and the way a revoked handle's lease goes
+     * back once its work has stopped.
      *
      * <p>Deliberately not {@code AutoCloseable}: giving a lease up is a round trip which can fail, and
      * a {@code void close()} in a try-with-resources would swallow that failure at exactly the moment
      * it matters most.
      *
-     * @return completion
+     * @return completion; a failed stage says the lease may still be standing, and the controller
+     *         taking over waits it out instead of taking it at once
      */
     CompletionStage<Void> release();
+
+    /**
+     * Publishes the request's {@code completedWhen} milestone at its generation, then gives the lease up.
+     *
+     * <p>In that order, which is the one {@link ExclusiveRequest#completedWhen()} rests on: published
+     * after the release, the milestone leaves a gap in which the next candidate is admitted to redo the
+     * work. Call it on success only, like {@link io.github.green4j.piplex.milestone.Milestones#publish}.
+     *
+     * <p>The lease is given up whatever the publish did. Nothing is published once ownership is gone:
+     * work finished by a run that was revoked is not that run's to announce. A publish already sent is
+     * not called back, though, and a {@link #release()} asked for meanwhile -- by a revocation listener,
+     * say -- waits for it to settle.
+     *
+     * @return what the publish did; failed when ownership is gone, when the publish failed, or -- with
+     *         the milestone already published -- when the release failed. Failed with nothing done at
+     *         all, the lease still held, when the request names no {@code completedWhen}
+     */
+    CompletionStage<PublishResult> completeAndRelease();
+
+    /**
+     * Stops renewing and watching without giving the lease up, and without telling any listener.
+     * Idempotent; {@link #release()} afterwards does nothing.
+     *
+     * <p>For a host that is going away while its work is not: the lease lapses within its term, and a
+     * host coming back inside that term retakes it under the same identity with the same fencing
+     * token. Given up instead, it would come back with a new one.
+     */
+    void abandon();
 }

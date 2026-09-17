@@ -1,16 +1,6 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      publish_mode:
-        description: "Publishing mode"
-        required: true
-        default: snapshot
-        type: choice
-        options:
-          - snapshot
-          - release
   push:
     tags:
       - "v*"
@@ -19,89 +9,136 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-permissions:
-  contents: read
+# Nothing here, and that is the point: every job below says what it may do, and the two halves of a
+# release want different answers. Building runs Gradle -- this repository's build logic, its plugins
+# and everything they resolve -- and needs to read the repository and nothing else. Publishing needs
+# the credentials that create a release and sign a provenance attestation, and runs no build at all.
+permissions: {}
 
 jobs:
-  publish:
-    name: Publish to Sonatype
+  # The same checks main is guarded by, run against the tagged commit. A tag can point at anything, so
+  # without this a release is the only build nothing has to pass.
+  checks:
+    name: Checks
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
+  build:
+    name: Build the .hpi
+    needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Set up JDK 17 (release baseline)
-        uses: actions/setup-java@v4
+      - name: Set up JDK 21 (release baseline)
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
           cache: gradle
 
-      - name: Resolve publish mode
-        id: mode
+      # A tag is what a release is found by afterwards, so it has to name what the .hpi is stamped
+      # with. A -SNAPSHOT version stamps the manifest as a private build and must never be released.
+      - name: Validate version
+        id: version
         shell: bash
-        run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            mode="release"
-          else
-            mode="${{ inputs.publish_mode }}"
-          fi
-          echo "publish_mode=${mode}" >> "${GITHUB_OUTPUT}"
-
-      - name: Validate version and secrets
-        shell: bash
-        env:
-          PUBLISH_MODE: ${{ steps.mode.outputs.publish_mode }}
-          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
-          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
-          SIGNING_GPG_SECRET_KEY: ${{ secrets.SIGNING_GPG_SECRET_KEY }}
-          SIGNING_GPG_PASSWORD: ${{ secrets.SIGNING_GPG_PASSWORD }}
         run: |
           version="$(tr -d '[:space:]' < version.txt)"
           if [[ -z "${version}" ]]; then
             echo "version.txt is empty"
             exit 1
           fi
-
-          # A tag is what a release is found by afterwards, so it has to name what was actually published.
-          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
             echo "Tag ${GITHUB_REF_NAME} does not match version.txt: expected v${version}"
             exit 1
           fi
-
-          if [[ -z "${SONATYPE_USERNAME}" || -z "${SONATYPE_PASSWORD}" ]]; then
-            echo "Missing SONATYPE_USERNAME or SONATYPE_PASSWORD secret"
+          if [[ "${version}" == *-SNAPSHOT ]]; then
+            echo "A release needs a non-snapshot version. Current version: ${version}"
             exit 1
           fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
-          if [[ "${PUBLISH_MODE}" == "snapshot" ]]; then
-            if [[ "${version}" != *-SNAPSHOT ]]; then
-              echo "Snapshot mode requires version ending with -SNAPSHOT. Current version: ${version}"
-              exit 1
-            fi
-          else
-            if [[ "${version}" == *-SNAPSHOT ]]; then
-              echo "Release mode requires non-snapshot version. Current version: ${version}"
-              exit 1
-            fi
-            if [[ -z "${SIGNING_GPG_SECRET_KEY}" || -z "${SIGNING_GPG_PASSWORD}" ]]; then
-              echo "Release mode requires SIGNING_GPG_SECRET_KEY and SIGNING_GPG_PASSWORD secrets"
-              exit 1
-            fi
-          fi
+      - name: Build, test and package
+        shell: bash
+        run: |
+          ./gradlew --no-daemon --stacktrace clean build :piplex-jenkins:jpi
+          mv "piplex-jenkins/build/libs/piplex-${{ steps.version.outputs.version }}.hpi" .
 
-      - name: Publish artifacts
+      # What an operator checks before installing, and the only thing that makes "the same bytes on
+      # every controller" checkable rather than asserted. sha256sum's own format, so `sha256sum -c` on
+      # the downloaded pair is the whole verification. Written here, beside the bytes it describes, and
+      # checked again in the job that publishes them.
+      - name: Checksum
+        shell: bash
+        run: |
+          asset="piplex-${{ steps.version.outputs.version }}.hpi"
+          sha256sum "${asset}" > "${asset}.sha256"
+          cat "${asset}.sha256"
+
+      - name: Hand the assets to the publishing job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hpi
+          path: |
+            piplex-${{ steps.version.outputs.version }}.hpi
+            piplex-${{ steps.version.outputs.version }}.hpi.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish the .hpi
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The credentials live here and nowhere else, in a job that runs no build of ours: id-token is what
+    # the attestation is signed with and is scoped to this run, contents writes the release. A Gradle
+    # build is thousands of lines of plugin and dependency code, and it has no business running in the
+    # job that holds them.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Take the assets from the build job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hpi
+
+      - name: Check the checksum
+        shell: bash
+        run: sha256sum -c "piplex-${{ needs.build.outputs.version }}.hpi.sha256"
+
+      # Says which workflow, at which commit, produced these bytes, signed by GitHub rather than by us.
+      # `gh attestation verify piplex-<version>.hpi --repo green4j/piplex` checks it, and that is a
+      # question worth being able to answer about a plugin that runs on a controller.
+      - name: Attest the build
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: piplex-${{ needs.build.outputs.version }}.hpi
+
+      # One file, and it carries everything: the core, the discas adapter and the discas client are
+      # inside it. An operator downloads it and deploys it to every controller.
+      #
+      # A re-run of a tag whose assets are already published stops here rather than replacing them: the
+      # bytes an operator has checksummed are not something to overwrite silently. Uploading what is
+      # missing after a partial run is a deliberate `gh release upload --clobber` by hand.
+      - name: Create the release
         shell: bash
         env:
-          PUBLISH_MODE: ${{ steps.mode.outputs.publish_mode }}
-          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
-          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
-          SIGNING_GPG_SECRET_KEY: ${{ secrets.SIGNING_GPG_SECRET_KEY }}
-          SIGNING_GPG_PASSWORD: ${{ secrets.SIGNING_GPG_PASSWORD }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          if [[ "${PUBLISH_MODE}" == "snapshot" ]]; then
-            ./gradlew --no-daemon --stacktrace clean build publish
+          asset="piplex-${{ needs.build.outputs.version }}.hpi"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${asset}" "${asset}.sha256"
           else
-            ./gradlew --no-daemon --stacktrace clean build publish uploadArtifactsToSonatypeCentralPortal
+            gh release create "${GITHUB_REF_NAME}" "${asset}" "${asset}.sha256" \
+              --title "${GITHUB_REF_NAME}" --generate-notes
           fi

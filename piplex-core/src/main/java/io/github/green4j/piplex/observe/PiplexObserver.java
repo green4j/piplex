@@ -13,21 +13,11 @@ import io.github.green4j.piplex.exclusive.Revocation;
 import java.time.Duration;
 
 /**
- * Everything piplex decides, offered as a closed vocabulary.
+ * Observer for piplex's fixed decision vocabulary.
  *
- * <p>piplex keeps no history of its own and never will: the store underneath holds current state, has
- * no change feed, and coalesces. History therefore lives where the runs do -- in build history and in
- * whatever aggregates their logs -- and this interface is the contract that makes such aggregation
- * possible across controllers which cannot see each other.
- *
- * <p>Two things are worth knowing about what it can and cannot tell you. It is complete about
- * <b>decisions</b>: a candidate which is not the owner parks rather than exits, so every controller
- * produces a line on every attempt and there are no silent non-decisions to infer. It is <b>not</b> an
- * audit trail: these events are written by the same process they describe. Who changed a designation,
- * and on whose authority, has to come from the operation that changed it.
- *
- * <p>Every method has a do-nothing default, so an implementation names only what it cares about.
- * Implementations are constructed explicitly and handed in.
+ * <p>Callbacks may run on caller, store or timer threads and must return quickly. Calls for different
+ * runs may overlap; calls for one run are ordered and made without piplex locks. Every method defaults
+ * to no action. Events support operational history but are not an authenticated audit trail.
  */
 public interface PiplexObserver {
 
@@ -63,6 +53,14 @@ public interface PiplexObserver {
     }
 
     /**
+     * Nobody holds the lease, and taking it lost to another attempt's write.
+     *
+     * @param run which run asked
+     */
+    default void contended(RunRef run) {
+    }
+
+    /**
      * The work for this generation is already done.
      *
      * @param run     which run asked
@@ -78,6 +76,19 @@ public interface PiplexObserver {
      * @param reason why it is off, where one was given
      */
     default void disabled(RunRef run, String reason) {
+    }
+
+    /**
+     * A key an attempt turns on could not be read, so the run was not admitted.
+     *
+     * <p>Separate from {@link #revoked} because nothing was ever held: the same bad bytes, found before
+     * the work started rather than under way.
+     *
+     * @param run    which run asked
+     * @param key    the key which could not be read
+     * @param detail what is wrong with it
+     */
+    default void guardUnreadable(RunRef run, String key, String detail) {
     }
 
     /**
@@ -154,4 +165,27 @@ public interface PiplexObserver {
     default void milestoneTimedOut(String milestone, Generation wanted, Generation reached) {
     }
 
+    /**
+     * Somebody else may run the work from now on.
+     *
+     * <p>Said by the process that made the change, so it is as trustworthy as that process: the log
+     * of an authenticated job, not an audit trail.
+     *
+     * @param key      what is competed for
+     * @param owner    who is designated now
+     * @param previous who was, or {@code null} when nobody was or the value did not parse
+     * @param reason   why, may be {@code null}
+     */
+    default void designated(String key, String owner, String previous, String reason) {
+    }
+
+    /**
+     * A switch was flipped.
+     *
+     * @param key     the switch
+     * @param enabled whether the work may run now
+     * @param reason  why, may be {@code null}
+     */
+    default void switched(String key, boolean enabled, String reason) {
+    }
 }

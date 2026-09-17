@@ -39,11 +39,11 @@ final class Examples {
             return stage.toCompletableFuture().get(WAIT_SECONDS, TimeUnit.SECONDS);
         } catch (final InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted", interrupted);
+            throw new IllegalStateException("Interrupted", interrupted);
         } catch (final ExecutionException failed) {
             throw new IllegalStateException(failed.getCause());
         } catch (final TimeoutException timedOut) {
-            throw new IllegalStateException("gave up after " + WAIT_SECONDS + "s", timedOut);
+            throw new IllegalStateException("Gave up after " + WAIT_SECONDS + "s", timedOut);
         }
     }
 

@@ -1,0 +1,18 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core">
+  <j:set var="duplicated" value="${it.duplicatedOwner()}"/>
+  <j:set var="silent" value="${it.silentOwner()}"/>
+  <j:if test="${duplicated != null}">
+    <div class="jenkins-alert jenkins-alert-warning">
+      Piplex: another live controller uses the owner id '${duplicated}'. Designations naming it
+      name both controllers, and which of them runs the work is left to chance. Give each controller its
+      own owner id in Manage Jenkins &gt; System.
+    </div>
+  </j:if>
+  <j:if test="${silent != null}">
+    <div class="jenkins-alert jenkins-alert-warning">
+      Piplex: this controller cannot write its heartbeat under 'piplex/instances/${silent}', so a second
+      controller using the same owner id would go unnoticed. Grant the controller's client GC on that key.
+    </div>
+  </j:if>
+</j:jelly>

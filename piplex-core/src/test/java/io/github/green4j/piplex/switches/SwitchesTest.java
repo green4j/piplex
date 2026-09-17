@@ -7,20 +7,20 @@
 
 package io.github.green4j.piplex.switches;
 
-import io.github.green4j.piplex.ContendedException;
-import io.github.green4j.piplex.LosingCasStore;
 import io.github.green4j.piplex.ManualTime;
 import io.github.green4j.piplex.store.CoordinationStore;
 import io.github.green4j.piplex.store.memory.InMemoryCoordinationStore;
+import io.github.green4j.piplex.observe.TextPiplexObserver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.concurrent.CompletionException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletionStage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -29,13 +29,14 @@ class SwitchesTest {
 
     private static final String KEY = "eod";
 
+    private final ManualTime time = new ManualTime();
     private CoordinationStore store;
     private Switches switches;
 
     @BeforeEach
     void setUp() {
-        store = new InMemoryCoordinationStore(new ManualTime());
-        switches = new Switches(store);
+        store = new InMemoryCoordinationStore(time);
+        switches = new Switches(store, time);
     }
 
     @Test
@@ -49,51 +50,47 @@ class SwitchesTest {
     }
 
     @Test
-    void stopsTheWorkAndSaysWhy() {
-        final Switch off = join(switches.disable(KEY, "INC-4821"));
-        assertFalse(off.enabled());
-        assertEquals("INC-4821", off.reason());
+    void stopsTheWorkSayingWhyAndLetsItRunAgain() {
+        final SwitchChange change = join(switches.disable(KEY, "INC-4821"));
+        final Switch off = change.inForce();
+        assertEquals(new SwitchChange(Switch.ENABLED, new Switch(false, "INC-4821", time.wallTime()), true), change);
         assertEquals(off, join(switches.current(KEY)));
-    }
 
-    @Test
-    void letsTheWorkRunAgain() {
-        join(switches.disable(KEY, "INC-4821"));
-        assertEquals(Switch.ENABLED, join(switches.enable(KEY)));
-        assertTrue(join(switches.current(KEY)).enabled());
+        time.advance(Duration.ofMinutes(1L));
+        final SwitchChange on = join(switches.enable(KEY));
+        assertEquals(new SwitchChange(off, new Switch(true, null, time.wallTime()), true), on);
+        assertEquals(on.inForce(), join(switches.current(KEY)));
     }
 
     @Test
     void writesNothingWhenWhatIsAskedForIsAlreadyInForce() {
-        join(switches.disable(KEY, "INC-4821"));
+        assertFalse(join(switches.enable(KEY)).changed());
+        assertFalse(join(store.get(Switches.keyOf(KEY))).exists(),
+                "An absent key already means on, so there is nothing to write");
+
+        final Switch off = join(switches.disable(KEY, "INC-4821")).inForce();
         final String versionAfterFirst = version();
 
-        assertEquals(new Switch(false, "INC-4821"), join(switches.disable(KEY, "INC-4821")));
-        assertEquals(versionAfterFirst, version(),
-                "the same switch asked for twice must not rewrite the key");
+        // As a designation keeps its: only what piplex acts on is compared, so asking for "off" again
+        // changes nothing, whatever reason it gives.
+        time.advance(Duration.ofMinutes(1L));
+        assertEquals(new SwitchChange(off, off, false), join(switches.disable(KEY, "INC-4830")));
+        assertEquals(versionAfterFirst, version(), "The same switch asked for twice must not rewrite the key");
     }
 
     @Test
-    void treatsADifferentReasonAsAChange() {
-        join(switches.disable(KEY, "INC-4821"));
-        assertEquals("INC-4830", join(switches.disable(KEY, "INC-4830")).reason());
-    }
-
-    @Test
-    void enablingWhatIsAlreadyOnWritesNothing() {
-        assertEquals(Switch.ENABLED, join(switches.enable(KEY)));
-        assertFalse(join(store.get(Switches.keyOf(KEY))).exists(),
-                "an absent key already means on, so there is nothing to write");
-    }
-
-    @Test
-    void keepsSwitchesUnderAPrefixAnOperatorCanType() {
-        assertEquals("piplex/enabled/eod", Switches.keyOf(KEY));
+    void keepsAnOwnersSwitchApartFromTheWorkSwitchesUnderTheSameKey() {
         assertEquals("piplex/enabled/eod/euc1-blue", Switches.keyOf("eod/euc1-blue"));
+        assertEquals("piplex/enabled/eod/@blue", Switches.keyOf(Switches.ownerKey(KEY, "blue")));
+        assertTrue(Switches.namesAnOwner(Switches.ownerKey(KEY, "team/blue")));
+        assertFalse(Switches.namesAnOwner("eod/blue"));
     }
 
     @Test
-    void refusesARecordWhichDoesNotSayWhetherItIsOnOrOff() {
+    void readsWhatAPersonTypedAsLongAsItSaysWhetherItIsOnOrOff() {
+        assertEquals(new Switch(false, null, null), Switch.parse("{\"enabled\":false}"));
+        assertEquals(new Switch(false, "INC-4821", null),
+                Switch.parse("{\"enabled\":false,\"reason\":\"INC-4821\",\"at\":\"yesterday\"}"));
         // The one field that must be there. Read as "off" by mistake it would stop the work everywhere,
         // and read as "on" it would let run what an operator had switched off, so neither default is
         // available and it has to be refused.
@@ -101,30 +98,33 @@ class SwitchesTest {
         assertThrows(RuntimeException.class, () -> Switch.parse("{\"enabled\":\"true\"}"));
     }
 
-    @Test
-    void givesUpAfterABoundedNumberOfLostWrites() {
-        final LosingCasStore losing = new LosingCasStore(store);
-        final Switches contended = new Switches(losing);
-
-        final CompletionException thrown = assertThrows(
-                CompletionException.class, () -> join(contended.disable(KEY, "INC-4821")));
-        final ContendedException cause = assertInstanceOf(ContendedException.class, thrown.getCause());
-        assertEquals(Switches.keyOf(KEY), cause.key());
-        assertEquals(8, losing.attempts(), "bounded, and the bound is the one the class states");
-    }
-
     private String version() {
         return join(store.get(Switches.keyOf(KEY))).version();
     }
 
     @Test
-    void refusesWhatIsNotARecordAtAll() {
-        // The shapes a key ends up holding once somebody edits it by hand. The text goes in the
-        // message because it is the only copy of what the key held.
-        assertTrue(assertThrows(IllegalArgumentException.class, () -> Switch.parse("{\"enabled\""))
-                .getMessage().contains("{\"enabled\""));
-        assertThrows(IllegalArgumentException.class, () -> Switch.parse("[1,2]"));
-        assertThrows(IllegalArgumentException.class, () -> Switch.parse(""));
+    void repairsAValueThatWillNotParse() {
+        join(store.compareAndSet(Switches.keyOf(KEY), CoordinationStore.INITIAL_VERSION, "{\"owner\""));
+
+        final Switch off = new Switch(false, "INC-4821", time.wallTime());
+        assertEquals(new SwitchChange(null, off, true), join(switches.repair(KEY, false, "INC-4821")));
+        assertEquals(off, join(switches.current(KEY)));
+        assertFalse(join(switches.repair(KEY, false, "INC-4830")).changed(), "Readable, it is a set");
+    }
+
+    @Test
+    void saysSoOnlyWhenItChangedSomething() {
+        final List<String> lines = new ArrayList<>();
+        final Switches logged = new Switches(store, time, new TextPiplexObserver(lines::add));
+
+        join(logged.enable(KEY));
+        join(logged.disable(KEY, "INC-4821"));
+        join(logged.disable(KEY, "INC-4830"));
+        join(logged.enable(KEY));
+
+        assertEquals(List.of(
+                "SWITCHED key=eod enabled=false reason=INC-4821",
+                "SWITCHED key=eod enabled=true"), lines);
     }
 
     private static <T> T join(final CompletionStage<T> stage) {

@@ -7,7 +7,6 @@
 
 package io.github.green4j.piplex.jenkins;
 
-import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.AbortException;
 import hudson.Extension;
 import hudson.model.Result;
@@ -27,24 +26,13 @@ import org.kohsuke.stapler.DataBoundSetter;
 
 import java.time.Duration;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 
 /**
- * {@code piplexAwait} -- wait until the data this build needs exists.
+ * {@code piplexAwait} -- waits without an executor until a milestone reaches a generation.
  *
- * <pre>
- * stage('Wait for EOD') {
- *     steps { piplexAwait key: 'data/euc1', generation: env.BUSINESS_DATE, timeout: '90m' }
- * }
- * </pre>
- *
- * <p>This is what replaces "end-of-day should be finished by half past five". It holds no executor while
- * it waits, so an hour of waiting costs a {@code FlowExecution} in memory, and it compares state rather
- * than catching an event, so a controller that restarts mid-wait simply looks again and carries on.
- *
- * <p>Running out of time fails the build by default, and should: something that was supposed to arrive
- * did not, and the reason it says so is that the alternative -- carrying on -- is how a day gets
- * imported half-empty without anybody noticing. Set {@code skipOnTimeout} when not running is genuinely
- * the right answer, and the build ends as {@code NOT_BUILT} with what was actually there recorded on it.
+ * <p>The timeout defaults to one hour and starts over after a controller restart. Timeout fails the
+ * build unless {@code skipOnTimeout} is set, in which case the result is {@code NOT_BUILT}.
  */
 public final class PiplexAwaitStep extends Step {
 
@@ -113,7 +101,6 @@ public final class PiplexAwaitStep extends Step {
         }
 
         @Override
-        @NonNull
         public String getDisplayName() {
             return "Wait for a piplex milestone";
         }
@@ -134,6 +121,11 @@ public final class PiplexAwaitStep extends Step {
         private final String timeout;
         private final boolean skipOnTimeout;
 
+        // Not carried across a restart: onResume asks again, and the answer that asking again waits for
+        // is one nothing has stopped yet.
+        private transient boolean answered;
+        private transient volatile CompletableFuture<AwaitResult> waiting;
+
         Execution(final StepContext context, final PiplexAwaitStep step) {
             super(context);
             this.key = step.getKey();
@@ -148,6 +140,41 @@ public final class PiplexAwaitStep extends Step {
             return false;
         }
 
+        /**
+         * Ends the step and the wait behind it, unless the answer it was waiting for got there first.
+         *
+         * @param cause why the build is stopping
+         */
+        @Override
+        public void stop(final Throwable cause) throws Exception {
+            if (answering()) {
+                final CompletableFuture<AwaitResult> asked = waiting;
+                if (asked != null) {
+                    asked.cancel(false);
+                }
+                super.stop(cause);
+            }
+        }
+
+        /**
+         * Claims the right to answer the context, once.
+         *
+         * <p>A cancelled wait still finishes the watch it is in, so the answer still coming and the
+         * build being stopped are two outcomes racing for one step. A flag read and then acted on
+         * leaves the gap between the two open, which is an aborted build getting a second outcome after
+         * somebody pressed the button. Whichever asks first here wins, and the other one does nothing.
+         *
+         * @return whether this caller is the one that gets to answer
+         */
+        private synchronized boolean answering() {
+            if (answered) {
+                return false;
+            }
+            answered = true;
+            return true;
+        }
+
+
         @Override
         public void onResume() {
             // A waiter holds no position of its own -- it knows which generation it needs and reads the
@@ -156,24 +183,32 @@ public final class PiplexAwaitStep extends Step {
             try {
                 await();
             } catch (final Exception failed) {
-                getContext().onFailure(failed);
+                if (answering()) {
+                    getContext().onFailure(failed);
+                }
             }
         }
 
         private void await() throws Exception {
             final TaskListener listener = getContext().get(TaskListener.class);
-            PiplexConfiguration.get().piplexFor(listener).milestones()
+            final CompletableFuture<AwaitResult> asked = PiplexConfiguration.require()
+                    .piplexFor(listener).milestones()
                     .awaitAtLeast(key, Generation.of(generation),
                             Durations.parse(timeout, DEFAULT_TIMEOUT, "timeout"))
-                    .whenComplete((result, error) -> {
-                        if (error != null) {
-                            getContext().onFailure(error);
-                        } else if (result.outcome() == AwaitResult.Outcome.REACHED) {
-                            getContext().onSuccess(result.inForce().generation().value());
-                        } else {
-                            getContext().onFailure(timedOut(result));
-                        }
-                    });
+                    .toCompletableFuture();
+            waiting = asked;
+            asked.whenComplete((result, error) -> {
+                if (!answering()) {
+                    return;
+                }
+                if (error != null) {
+                    getContext().onFailure(error);
+                } else if (result.outcome() == AwaitResult.Outcome.REACHED) {
+                    getContext().onSuccess(result.inForce().generation().value());
+                } else {
+                    getContext().onFailure(timedOut(result));
+                }
+            });
         }
 
         private Throwable timedOut(final AwaitResult result) {

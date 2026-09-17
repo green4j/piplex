@@ -14,6 +14,7 @@ import io.github.green4j.piplex.Generation;
 
 import java.io.StringWriter;
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.Objects;
 
 /**
@@ -50,14 +51,26 @@ public record Milestone(Generation generation, String by, String runId, Instant 
         try {
             object = new JsonValueParser().parseAndEoj(text).asObjectRequired();
         } catch (final RuntimeException notAnObject) {
-            throw new IllegalArgumentException("not a JSON object: " + text, notAnObject);
+            throw new IllegalArgumentException("Not a JSON object: " + text, notAnObject);
         }
         final String at = object.getString("at");
         return new Milestone(
                 Generation.of(object.getStringRequired("generation")),
                 object.getString("by"),
                 object.getString("runId"),
-                at == null ? null : Instant.parse(at));
+                instantOrNull(at));
+    }
+
+    // Provenance: a stamp that does not parse is dropped rather than making the whole key unreadable.
+    private static Instant instantOrNull(final String text) {
+        if (text == null) {
+            return null;
+        }
+        try {
+            return Instant.parse(text);
+        } catch (final DateTimeParseException malformed) {
+            return null;
+        }
     }
 
     /**

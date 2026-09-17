@@ -1,5 +1,3 @@
-import io.github.green4j.piplex.build.SonatypeCentralPortalUploadRepositoryTask
-
 /*
  * Copyright (c) 2026 Anatoly Gudkov and others.
  *
@@ -8,15 +6,17 @@ import io.github.green4j.piplex.build.SonatypeCentralPortalUploadRepositoryTask
  */
 
 plugins {
-    id 'com.github.johnrengelman.shadow' version '7.1.2' apply false
-    id 'org.jenkins-ci.jpi' version "${jpiPluginVersion}" apply false
+    id 'org.jenkins-ci.jpi2' version "${jpiPluginVersion}" apply false
 }
 
 defaultTasks 'clean', 'build'
 
 def projectVersion = file('version.txt').text.trim()
 
-def getConfigProperty(final String propertyName) {
+// A script variable rather than a method, and the two below rather than ext: a subproject reaching
+// into the root for either one is deprecated in Gradle 9 and gone in 10, while what a closure in this
+// file closes over stays local to it.
+def configProperty = { final String propertyName ->
     String value = project.findProperty(propertyName)
     if (!value) {
         value = System.getenv(propertyName)
@@ -27,92 +27,16 @@ def getConfigProperty(final String propertyName) {
     return value.trim()
 }
 
-def addDepsFromProjects(pom, projects) {
-    pom.withXml {
-        def depsNode = asNode().appendNode('dependencies')
-        def addedDeps = [] as Set
+def piplexSrcJavaVersion = JavaVersion.toVersion(srcJavaVersion)
 
-        projects.each { proj ->
-            // api -> compile scope
-            proj.configurations.api.allDependencies.each { dep ->
-                if (dep instanceof ExternalModuleDependency
-                        && addedDeps.add("${dep.group}:${dep.name}")) {
-                    def node = depsNode.appendNode('dependency')
-                    node.appendNode('groupId', dep.group)
-                    node.appendNode('artifactId', dep.name)
-                    node.appendNode('version', dep.version)
-                    node.appendNode('scope', 'compile')
-                }
-            }
-
-            // implementation -> runtime scope
-            proj.configurations.implementation.allDependencies.each { dep ->
-                if (dep instanceof ExternalModuleDependency
-                        && addedDeps.add("${dep.group}:${dep.name}")) {
-                    def node = depsNode.appendNode('dependency')
-                    node.appendNode('groupId', dep.group)
-                    node.appendNode('artifactId', dep.name)
-                    node.appendNode('version', dep.version)
-                    node.appendNode('scope', 'runtime')
-                }
-            }
-        }
-    }
-}
-
-ext {
-    piplexSrcJavaVersion = JavaVersion.toVersion(srcJavaVersion)
-
-    // Sources are pure ASCII, and are never decoded with whatever encoding the build machine
-    // happens to default to. javac reports any non-ASCII byte as an unmappable character. Write
-    // one in a literal as \\uXXXX, and in javadoc as its ASCII equivalent ("--").
-    piplexSourceEncoding = 'US-ASCII'
-
-    isRelease = !projectVersion.endsWith('-SNAPSHOT')
-
-    sonatypeReleasesRepoUrl = isRelease
-            ? 'https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/'
-            : 'https://central.sonatype.com/repository/maven-snapshots/'
-
-    sonatypeUsername = getConfigProperty('SONATYPE_USERNAME')
-    sonatypePassword = getConfigProperty('SONATYPE_PASSWORD')
-
-    signingKey = getConfigProperty('SIGNING_GPG_SECRET_KEY')    // ascii-armored secret key
-    signingPassword = getConfigProperty('SIGNING_GPG_PASSWORD') // plain text
-}
-
-def projectPom = {
-    name = projectName
-    description = 'Cross-instance orchestration primitives for Jenkins pipelines.'
-    url = 'https://github.com/green4j/piplex'
-
-    scm {
-        connection = 'scm:git:https://github.com/green4j/piplex.git'
-        developerConnection = 'scm:git:https://github.com/green4j/piplex.git'
-        url = 'https://github.com/green4j/piplex.git'
-    }
-
-    licenses {
-        license {
-            name = 'MIT License'
-            url = 'https://opensource.org/licenses/MIT'
-        }
-    }
-
-    developers {
-        developer {
-            id = 'anatolygudkov'
-            name = 'Anatoly Gudkov'
-            email = 'gudkovanatoly@hotmail.com'
-            url = 'https://github.com/anatolygudkov'
-        }
-    }
-}
+// Sources are pure ASCII, and are never decoded with whatever encoding the build machine
+// happens to default to. javac reports any non-ASCII byte as an unmappable character. Write
+// one in a literal as \\uXXXX, and in javadoc as its ASCII equivalent ("--").
+def piplexSourceEncoding = 'US-ASCII'
 
 def coreProject = project(':piplex-core')
 def discasProject = project(':piplex-discas')
 def jenkinsProject = project(':piplex-jenkins')
-def allProject = project(':piplex-all')
 def exampleProject = project(':piplex-example')
 
 subprojects {
@@ -122,17 +46,16 @@ subprojects {
     version = projectVersion
 
     repositories {
-        mavenLocal()
+        // Central only. mavenLocal() resolves ahead of it, so a dependency built on somebody's laptop
+        // silently replaces the published one of the same version, and the .hpi stops being the bytes
+        // this git hash describes -- which is the whole claim a release makes. Trying an unpublished
+        // discas is `--include-build ../discas`, which says so at the command line and leaves no trace
+        // in the build.
         mavenCentral()
     }
 
-    java {
-        withSourcesJar()
-        withJavadocJar()
-    }
-
     javadoc {
-        failOnError false
+        failOnError = false
 
         title = "<h1>${projectName}</h1>"
         options.bottom = "<i>Copyright &#169; ${projectCopyright}. All Rights Reserved.</i>"
@@ -151,20 +74,12 @@ subprojects {
         }
         includeEmptyDirs = false
     }
-
-    tasks.withType(Sign).configureEach {
-        onlyIf {
-            isRelease && gradle.taskGraph.hasTask(tasks.publish)
-        }
-    }
 }
 
-// Everything gets checkstyle and the same test setup. Publishing is configured per module below,
-// because piplex-example is meant to be read and run, not depended on.
+// Everything gets checkstyle and the same test setup.
 configure([coreProject,
            discasProject,
            jenkinsProject,
-           allProject,
            exampleProject]) {
     apply plugin: 'checkstyle'
 
@@ -202,15 +117,23 @@ configure([coreProject,
             events 'skipped', 'failed'
             showStandardStreams = true
             exceptionFormat = 'full'
-            afterSuite { desc, result ->
-                if (!desc.parent) {
-                    println "Results: ${result.resultType} (${result.testCount} tests, " +
-                            "${result.successfulTestCount} successes, " +
-                            "${result.failedTestCount} failures, " +
-                            "${result.skippedTestCount} skipped)"
-                }
-            }
         }
+
+        // One line per module saying how many tests ran, which Gradle itself does not print. A listener
+        // rather than the task's own afterSuite hook: that one is deprecated in 9 and gone in 10.
+        addTestListener([
+                beforeSuite: { desc -> },
+                afterSuite: { desc, result ->
+                    if (!desc.parent) {
+                        println "Results: ${result.resultType} (${result.testCount} tests, " +
+                                "${result.successfulTestCount} successes, " +
+                                "${result.failedTestCount} failures, " +
+                                "${result.skippedTestCount} skipped)"
+                    }
+                },
+                beforeTest: { desc -> },
+                afterTest: { desc, result -> }
+        ] as TestListener)
     }
 }
 
@@ -227,21 +150,23 @@ configure([coreProject,
 }
 
 configure(coreProject) {
-    apply plugin: 'maven-publish'
-    apply plugin: 'signing'
+    // What every CoordinationStore owes the primitives, shared with the adapters' own tests.
+    apply plugin: 'java-test-fixtures'
 
     // The core stays host-agnostic. The Jenkins plugin is an adapter over it, and a second host later --
     // Airflow, or anything else -- must mean another adapter, not a rewritten engine. That only holds if
     // nothing from a host ever reaches this module, so the build checks rather than trusts.
     tasks.register('checkCoreIsHostAgnostic') {
+        // Named one by one: a group-wide pass would let in discas-client, or anything else we publish.
+        final def allowed = ["${projectGroup}:green-jelly".toString()] as Set
         final def runtime = configurations.runtimeClasspath
         doLast {
-            final def foreign = runtime.resolvedConfiguration.resolvedArtifacts.findAll {
-                it.moduleVersion.id.group != projectGroup
-            }.collect { "${it.moduleVersion.id.group}:${it.moduleVersion.id.name}" }
+            final def foreign = runtime.resolvedConfiguration.resolvedArtifacts.collect {
+                "${it.moduleVersion.id.group}:${it.moduleVersion.id.name}".toString()
+            }.findAll { !allowed.contains(it) }
             if (!foreign.isEmpty()) {
                 throw new GradleException(
-                        "piplex-core must depend on ${projectGroup} artifacts only, but found: ${foreign}. " +
+                        "piplex-core may depend on ${allowed} only, but found: ${foreign}. " +
                         'Anything host-specific belongs in an adapter module.')
             }
         }
@@ -251,168 +176,34 @@ configure(coreProject) {
 
     dependencies {
         // The only runtime dependency of the core: the discas client carries no JSON at all, and the
-        // records piplex keeps in a key are JSON. green-jelly is what newa and both buildSrc use.
+        // records piplex keeps in a key are JSON.
         api "io.github.green4j:green-jelly:$greenJellyVersion"
-    }
 
-    publishing {
-        publications {
-            piplexCore(MavenPublication) {
-                from components.java
-                pom(projectPom)
-            }
-        }
-
-        repositories {
-            maven {
-                name = 'MavenCentral'
-                url(sonatypeReleasesRepoUrl)
-                credentials {
-                    username = sonatypeUsername
-                    password = sonatypePassword
-                }
-            }
-        }
-    }
-
-    signing {
-        if (signingKey) {
-            useInMemoryPgpKeys(signingKey, signingPassword)
-        }
-        sign publishing.publications.piplexCore
+        testFixturesApi "org.junit.jupiter:junit-jupiter:${jupiterVersion}"
     }
 }
 
 configure(discasProject) {
-    apply plugin: 'maven-publish'
-    apply plugin: 'signing'
-
     dependencies {
-        api(coreProject)
+        api project(coreProject.path)
         api "io.github.green4j:discas-client:$discasVersion"
 
         // Tests only. The client is final, so the adapter is exercised against a node brought up in
         // the test JVM rather than against a stand-in for one.
         testImplementation "io.github.green4j:discas-node:$discasVersion"
-    }
-
-    publishing {
-        publications {
-            piplexDiscas(MavenPublication) {
-                from components.java
-                pom(projectPom)
-            }
-        }
-
-        repositories {
-            maven {
-                name = 'MavenCentral'
-                url(sonatypeReleasesRepoUrl)
-                credentials {
-                    username = sonatypeUsername
-                    password = sonatypePassword
-                }
-            }
-        }
-    }
-
-    signing {
-        if (signingKey) {
-            useInMemoryPgpKeys(signingKey, signingPassword)
-        }
-        sign publishing.publications.piplexDiscas
+        testImplementation testFixtures(project(coreProject.path))
     }
 }
 
-configure(allProject) {
-    apply plugin: 'maven-publish'
-    apply plugin: 'signing'
-    apply plugin: 'com.github.johnrengelman.shadow'
-
-    dependencies {
-        api coreProject
-        api discasProject
-    }
-
-    shadowJar {
-        archiveBaseName = jar.archiveBaseName
-        archiveAppendix = jar.archiveAppendix
-        archiveClassifier = ''
-        manifest.attributes(
-                'Implementation-Title': projectName,
-                'Implementation-Version': projectVersion,
-                'Implementation-Vendor': projectAuthor,
-                'Automatic-Module-Name': 'io.github.green4j.piplex.all')
-
-        dependencies {
-            include(project(coreProject.path))
-            include(project(discasProject.path))
-        }
-    }
-
-    jar.finalizedBy shadowJar
-
-    sourcesJar {
-        from files(
-                coreProject.sourceSets.main.allSource,
-                discasProject.sourceSets.main.allSource)
-    }
-
-    javadoc {
-        source += coreProject.sourceSets.main.allJava
-        source += discasProject.sourceSets.main.allJava
-    }
-
-    publishing {
-        publications {
-            piplexAll(MavenPublication) {
-                artifact shadowJar
-                artifact sourcesJar
-                artifact javadocJar
-                pom(projectPom)
-                addDepsFromProjects(pom, [coreProject, discasProject])
-            }
-        }
-
-        repositories {
-            maven {
-                name = 'MavenCentral'
-                url(sonatypeReleasesRepoUrl)
-                credentials {
-                    username = sonatypeUsername
-                    password = sonatypePassword
-                }
-            }
-        }
-    }
-
-    signing {
-        if (signingKey) {
-            useInMemoryPgpKeys(signingKey, signingPassword)
-        }
-        sign publishing.publications.piplexAll
-    }
-}
-
-// The adapter for one host. It is not published to Maven Central: a .hpi is installed into a
-// controller, not depended on, and the two things Central is for -- resolution and signatures -- buy
-// nothing here.
+// The adapter for one host, and the only thing this build ships: a .hpi is installed into a
+// controller, not depended on.
 configure(jenkinsProject) {
-    apply plugin: 'org.jenkins-ci.jpi'
+    apply plugin: 'org.jenkins-ci.jpi2'
 
     repositories {
-        maven {
-            name = 'JenkinsPublic'
-            url = 'https://repo.jenkins-ci.org/public/'
-        }
-    }
-
-    // The jpi plugin stamps Minimum-Java-Version from the project's Java settings, and a controller
-    // refuses a plugin that asks for more than it runs. Without this it stamps whatever JDK happened to
-    // run the build, which is how a plugin built on 21 quietly stops installing on a 17 controller.
-    java {
-        sourceCompatibility = piplexSrcJavaVersion
-        targetCompatibility = piplexSrcJavaVersion
+        // The plugin's own shorthand for repo.jenkins-ci.org, so the one place a Jenkins artifact can
+        // come from is named rather than spelled out.
+        jenkinsPublic()
     }
 
     // A baseline is a core version and the plugin BOM that was tested against it, and choosing one is
@@ -420,10 +211,10 @@ configure(jenkinsProject) {
     // a BOM from another line: that resolves perfectly well and quietly tests a combination nobody ships.
     // Adding a line here is the whole change; nothing else has a version of Jenkins in it.
     def jenkinsLines = [
-            '2.516.3': 'bom-2.516.x:6210.v69ea_fd8a_f010',
+            '2.555.1': 'bom-2.555.x:7020.vf38cb_40380d1',
             '2.568.3': 'bom-2.568.x:7020.vf38cb_40380d1'
     ]
-    def jenkinsBaseline = getConfigProperty('jenkinsVersion') ?: project.property('jenkinsVersion')
+    def jenkinsBaseline = configProperty('jenkinsVersion') ?: project.property('jenkinsVersion')
     def jenkinsBom = jenkinsLines[jenkinsBaseline]
     if (jenkinsBom == null) {
         throw new GradleException(
@@ -435,11 +226,10 @@ configure(jenkinsProject) {
 
     jenkinsPlugin {
         jenkinsVersion = jenkinsBaseline
-        shortName = 'piplex'
+        pluginId = 'piplex'
         displayName = 'piplex'
-        url = 'https://github.com/green4j/piplex'
-        gitHubUrl = 'https://github.com/green4j/piplex'
-        fileExtension = 'hpi'
+        homePage = uri('https://github.com/green4j/piplex')
+        archiveExtension = 'hpi'
     }
 
     dependencies {
@@ -448,17 +238,23 @@ configure(jenkinsProject) {
         // controller than it says it does.
         implementation platform("io.jenkins.tools.bom:${jenkinsBom}")
 
-        implementation coreProject
-        implementation discasProject
+        implementation project(coreProject.path)
+        implementation project(discasProject.path)
 
         implementation 'org.jenkins-ci.plugins.workflow:workflow-step-api'
         implementation 'org.jenkins-ci.plugins.workflow:workflow-api'
         implementation 'org.jenkins-ci.plugins:structs'
 
+        // No jsr305, and so no @NonNull anywhere in this module. Jenkins' own @NonNull is
+        // meta-annotated with javax.annotation.Nonnull, javac warns on an annotation whose class file
+        // it cannot read, and -Werror turns that into a failure -- so using one annotation means
+        // carrying a dependency for it. What it was on was five getDisplayName() overrides returning
+        // a literal, each already @NonNull in the Jenkins class it overrides.
+
         // Jenkins finds an extension through an index generated at compile time, not by scanning at
         // startup. Without these two on the processor path everything compiles and nothing is found.
-        annotationProcessor 'net.java.sezpoz:sezpoz:1.13'
-        annotationProcessor 'org.jenkins-ci:annotation-indexer:1.18'
+        annotationProcessor "net.java.sezpoz:sezpoz:$sezpozVersion"
+        annotationProcessor "org.jenkins-ci:annotation-indexer:$annotationIndexerVersion"
 
         testImplementation 'org.jenkins-ci.plugins.workflow:workflow-job'
         testImplementation 'org.jenkins-ci.plugins.workflow:workflow-cps'
@@ -481,28 +277,95 @@ configure(jenkinsProject) {
         options.compilerArgs.add('-Xlint:-processing')
     }
 
-    // Nothing here is published, so the artifacts the other modules owe Maven Central are dead weight.
-    [tasks.named('javadoc'), tasks.named('javadocJar'), tasks.named('sourcesJar')].each {
-        it.configure { enabled = false }
+    // Named after the plugin rather than after the module, so what the build writes is byte for byte
+    // the file a release publishes and an operator installs: piplex-<version>.hpi.
+    tasks.named('jpi') {
+        archiveBaseName = 'piplex'
+
+        // jpi2 reads Minimum-Java-Version off the toolchain and stamps 17 when there is none. A
+        // toolchain would pin the JDK the build compiles with, which is the one thing the CI matrix is
+        // there to vary, so the attribute is written rather than implied. A controller refuses a plugin
+        // that asks for more Java than it runs, and this is the number it refuses on.
+        manifest {
+            attributes 'Minimum-Java-Version': piplexSrcJavaVersion.majorVersion
+        }
+    }
+
+    // Resuming a CPS flow deserialises through XStream, which reads private fields of java.base types
+    // -- TreeSet's backing map among them -- and a JDK past 16 refuses that unless the package is
+    // opened. A controller gets these from the Add-Opens entry in jenkins.war's manifest, which only
+    // applies to `java -jar`; the test JVM is launched by Gradle, so the same list goes here.
+    test {
+        jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED',
+                '--add-opens=java.base/java.io=ALL-UNNAMED',
+                '--add-opens=java.base/java.util=ALL-UNNAMED',
+                '--add-opens=java.desktop/com.sun.beans.introspect=ALL-UNNAMED'
+
+        // HtmlUnit's JavaCC-generated parser already has a method close to the JVM's 64 KiB limit.
+        // JaCoCo probes push it over that limit even though dependency classes are not in our report.
+        jacoco {
+            excludes = ['org.htmlunit.cssparser.parser.javacc.CSS3ParserTokenManager']
+        }
+    }
+
+    // What a running build writes down, recorded once per STATE_VERSION and committed; the build only
+    // reads it (StateFixturesTest). Recording is a person's step: bytes the build made for itself would
+    // always agree with the code that made them.
+    test {
+        useJUnitPlatform {
+            excludeTags 'record-state-fixtures'
+        }
+    }
+    tasks.register('recordStateFixtures', Test) {
+        group = 'verification'
+        description = 'Records the saved-state fixtures of the current STATE_VERSION, once'
+        testClassesDirs = test.testClassesDirs
+        classpath = test.classpath
+        jvmArgs = test.jvmArgs
+        useJUnitPlatform {
+            includeTags 'record-state-fixtures'
+        }
+        systemProperty 'piplex.recordStateFixtures',
+                file('src/test/resources/io/github/green4j/piplex/jenkins/state').path
+        outputs.upToDateWhen { false }
+    }
+
+    // The jpi plugin brings sources and javadoc jars of its own, for a publication this build does not
+    // make. Only the .hpi ships, so they are dead weight on every build. Matched rather than named:
+    // the plugin registers them after this block is evaluated.
+    tasks.matching { it.name in ['javadoc', 'javadocJar', 'sourcesJar'] }.configureEach {
+        enabled = false
     }
 }
 
 configure(exampleProject) {
     dependencies {
-        implementation coreProject
-        implementation discasProject
+        implementation project(coreProject.path)
+        implementation project(discasProject.path)
     }
 
-    // Nothing here is published, so the artifacts the other modules owe Maven Central are dead weight
-    // on every build.
-    [tasks.named('javadoc'), tasks.named('javadocJar'), tasks.named('sourcesJar')].each {
-        it.configure { enabled = false }
+    // The examples exist to be read and run, and the second half needs a task. One task told which main
+    // to run, rather than the application plugin: there is no single entry point here and no
+    // distribution to build. A bare class name is enough -- they all live in the one package.
+    //
+    //   ./gradlew :piplex-example:run -PmainClass=ElectedRunExample
+    //   ./gradlew :piplex-example:run -PmainClass=DiscasStoreExample \
+    //           --args="euc1-blue eod n1=127.0.0.1:7101 n2=127.0.0.1:7102 n3=127.0.0.1:7103"
+    def named = providers.gradleProperty('mainClass')
+    tasks.register('run', JavaExec) {
+        group = 'application'
+        description = 'Runs one example, named with -PmainClass'
+        classpath = sourceSets.main.runtimeClasspath
+        mainClass = named.map { name ->
+            name.indexOf('.') < 0 ? "io.github.green4j.piplex.example.${name}" : name
+        }
+        doFirst {
+            // Named rather than defaulted: five examples, and running whichever one happened to be
+            // first is not what somebody who forgot the flag meant.
+            if (!named.present) {
+                throw new GradleException('Which example? Name it, as '
+                        + './gradlew :piplex-example:run -PmainClass=ElectedRunExample')
+            }
+        }
     }
-}
-
-tasks.register('uploadArtifactsToSonatypeCentralPortal', SonatypeCentralPortalUploadRepositoryTask) {
-    portalUsername.set(sonatypeUsername)
-    portalPassword.set(sonatypePassword)
-    groupId.set(projectGroup)
-    snapshotRelease.set(!isRelease)
 }

@@ -8,13 +8,13 @@
 package io.github.green4j.piplex;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.time.LocalDate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GenerationTest {
 
@@ -24,29 +24,20 @@ class GenerationTest {
         assertThrows(NullPointerException.class, () -> Generation.of(null));
     }
 
-    @Test
-    void comparesLexicographicallyAndSoSortsTenBeforeNine() {
-        // Not a defect and not to be "fixed": the ordering is documented as lexicographic, and a caller
-        // using a bare counter is told to zero-pad it. This test is here so that a later change to a
-        // natural ordering has to be a deliberate one which breaks it.
-        assertTrue(Generation.of("10").compareTo(Generation.of("9")) < 0);
-        assertTrue(Generation.of("09").compareTo(Generation.of("10")) < 0);
-    }
-
-    @Test
-    void ordersDatesTheWayTimeDoes() {
-        final Generation first = Generation.ofDate(LocalDate.parse("2026-09-12"));
-        final Generation next = Generation.ofDate(LocalDate.parse("2026-09-13"));
-        final Generation overAMonthEnd = Generation.ofDate(LocalDate.parse("2026-10-01"));
-        assertTrue(next.atLeast(first));
-        assertFalse(first.atLeast(next));
-        assertTrue(overAMonthEnd.atLeast(next), "ISO-8601 is why the month end needs no special case");
-    }
-
-    @Test
-    void hasReachedItself() {
-        final Generation one = Generation.of("2026-09-12");
-        assertTrue(one.atLeast(Generation.of("2026-09-12")));
+    // "10" before "9" is not a defect: the ordering is documented as lexicographic, and a caller using a
+    // bare counter is told to zero-pad it. A change to a natural ordering has to break this on purpose.
+    // ISO-8601 dates are why the month end needs no special case.
+    @ParameterizedTest
+    @CsvSource({
+        "10,         9,          false",
+        "10,         09,         true",
+        "2026-09-12, 2026-09-12, true",
+        "2026-09-13, 2026-09-12, true",
+        "2026-09-12, 2026-09-13, false",
+        "2026-10-01, 2026-09-13, true",
+    })
+    void comparesLexicographically(final String one, final String other, final boolean atLeast) {
+        assertEquals(atLeast, Generation.of(one).atLeast(Generation.of(other)));
     }
 
     @Test

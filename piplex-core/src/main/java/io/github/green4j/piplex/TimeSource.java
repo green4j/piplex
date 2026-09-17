@@ -13,31 +13,10 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Where time comes from: how long since, how long until, when to run something, and what to stamp on a
- * record.
+ * Monotonic elapsed time, scheduling and human-readable wall time.
  *
- * <p>Every duration piplex measures is measured here, and nothing measures durations with a wall clock.
- * A wall clock is a statement about what time it is, and it is allowed to change: NTP steps it,
- * an operator sets it, a suspended VM resumes with hours missing. A lease timed against one can lapse
- * early -- two runs at once -- or late, and a handover can wait for a deadline that has moved. A
- * monotonic reading only ever goes forward, at one second per second, which is the single property all
- * of this depends on.
- *
- * <p>Readings are meaningful only as differences, and only within one process. Comparing one to another
- * process's is meaningless, which is why nothing crossing the wire carries one: what the store reports
- * about a lease is a <b>remaining duration</b>, converted against the local reading on arrival.
- *
- * <p>Scheduling belongs here for the same reason. "In thirty seconds" is elapsed time, and a scheduler
- * that honoured it against a wall clock would sleep through a clock change.
- *
- * <p>The wall clock has one job left, and it is not timing: {@link #wallTime()} stamps the records, so
- * that a person reading a key knows roughly when something happened. Nothing compares those stamps, and
- * nothing decides anything by them. It lives on this interface rather than beside it because a caller
- * given two time sources can hand in two that disagree, and because which of the two a piece of code
- * should be using is a question worth answering once, here, instead of at every call site.
- *
- * <p>Tests pass a ticker they advance by hand, which is why a lease expiry or a four-hour handover takes
- * no wall-clock time at all. Constructed explicitly and handed in, like everything else here.
+ * <p>All deadlines use {@link #nanos()}; {@link #wallTime()} only stamps records. Monotonic readings are
+ * process-local, so stores report remaining lease durations rather than clock values.
  */
 public interface TimeSource {
 
@@ -111,6 +90,9 @@ public interface TimeSource {
 
     /**
      * The system clocks and a scheduler, for production use.
+     *
+     * <p>Timers here are cancelled all the time, so give it a {@code ScheduledThreadPoolExecutor} with
+     * {@code setRemoveOnCancelPolicy(true)}: otherwise a cancelled one is kept until it would have fired.
      *
      * @param executor where scheduled actions run; its lifecycle stays with the caller
      * @return the time source

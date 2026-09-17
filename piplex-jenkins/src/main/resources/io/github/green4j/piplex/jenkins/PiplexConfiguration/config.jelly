@@ -15,7 +15,7 @@
     </f:entry>
 
     <f:entry title="Watch poll period" field="watchPollPeriod"
-             description="How long a watch waits between polls, e.g. 30s or 2m. A watch in discas is a poll, not a subscription, and every poll of every watch is a consensus round. Leave empty for the discas client's own setting, which polls every second: right for work that changes by the minute, far more than a nightly job needs. At least 500ms.">
+             description="The shortest gap between polls of a waiting run's watch, e.g. 30s or 2m; the gap actually taken is spread up to five times it. A watch in discas is a poll, not a subscription, and every poll of every watch is a consensus round. Raising this leaves a standby controller's notice nearly untouched -- it re-reads every round anyway -- and a run already under way always polls at the client's own period, so a disable stops it as fast as before. Leave empty for the discas client's own period of one second: right for work that changes by the minute, far more than a nightly job needs. At least 500ms.">
       <f:textbox/>
     </f:entry>
 
@@ -40,6 +40,11 @@
       <f:entry title="Key store password" field="tlsKeystorePassword"
                description="Opens the key store, and is taken as the private key's password too.">
         <f:password/>
+      </f:entry>
+      <f:entry field="tlsVerifyNodeIdentity">
+        <f:checkbox title="Check the node's identity"
+                    description="Requires the certificate a node presents to name one of the nodes above, by its nodeId or by its host, in the certificate's subject alternative name -- or in its common name where it has none, which is what a self-signed certificate made for one host usually is. Without this, any certificate the trust store accepts is enough, and with the JVM's own trust store that means any host holding a certificate from any public CA. It may only be turned off where a trust store is configured, since that pins which certificates count. It does not bind a certificate to the node this particular connection went to: the discas client mints its TLS engines without being told which node they are dialling, so what is checked is that the certificate belongs to this cluster."
+                    default="true"/>
       </f:entry>
     </f:optionalBlock>
   </f:section>

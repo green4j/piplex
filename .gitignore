@@ -8,3 +8,6 @@ out/
 
 # the dev controller's JENKINS_HOME, made by :piplex-jenkins:server
 work/
+
+# where the test harness unpacks jenkins.war; the path is Maven's, not ours to choose
+target/

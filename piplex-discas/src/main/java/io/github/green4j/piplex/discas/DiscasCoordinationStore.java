@@ -17,48 +17,46 @@ import io.github.green4j.discas.client.lock.LockAcquireResult;
 import io.github.green4j.discas.client.lock.LockInfo;
 import io.github.green4j.discas.client.lock.LockToken;
 import io.github.green4j.discas.client.lock.LockWriteStatus;
+import io.github.green4j.piplex.ContendedException;
 import io.github.green4j.piplex.store.CoordinationStore;
 import io.github.green4j.piplex.store.Entry;
 import io.github.green4j.piplex.store.LeaseAttempt;
 import io.github.green4j.piplex.store.LeaseHandle;
+import io.github.green4j.piplex.store.Watch;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 /**
- * {@link CoordinationStore} over a discas cluster.
+ * {@link CoordinationStore} backed by a discas cluster.
  *
- * <p>Constructed explicitly around a client the caller already made and already owns:
+ * <p>The caller supplies a long-lived client and chooses whether this store closes it. Use a distinct,
+ * authenticated client id per deployment. Watches preserve discas' confirmed/unconfirmed result;
+ * background watches may use a slower poll period while urgent holder watches keep the client period.
  *
- * <pre>{@code
- * DisCasClient client = DisCasClientFactory.create(ClientId.of("jenkins-euc1-blue"), bootstrap);
- * CoordinationStore store = new DiscasCoordinationStore(client);
- * }</pre>
- *
- * <p><b>Give every controller its own {@code ClientId}, and turn authentication on.</b> Two things
- * follow from discas' own documentation and both matter here. A shared HTTP agent speaks with the
- * agent's identity, so four controllers behind agents collapse into one identity and nothing can be
- * attributed to any of them -- which is why this adapter takes the Java client rather than the agent.
- * And in the default {@code AllowAll} mode a client id is merely claimed, not checked, so any record of
- * who did what is worth no more than the claim until TOKEN or mTLS is switched on.
- *
- * <p><b>discas 0.0.2 or later.</b> Not a preference: 0.0.2 is where an acquire whose fenced write lost
- * to somebody who left the key free answers {@code NOT_HELD} rather than naming a holder it has not
- * got, and this adapter reads that answer literally. Against 0.0.1 the same moment arrives as a lock
- * held by nobody, which is refused here rather than guessed at. The two cannot be mixed anyway -- the
- * client and the nodes must be the same version, because {@code CLIENT_HELLO} changed shape in 0.0.2
- * without the protocol version changing with it.
+ * <p>The adapter requires discas 0.0.4 or later, and client and nodes must use the same version.
  */
 public final class DiscasCoordinationStore implements CoordinationStore {
+
+    // A fenced write and the one retry a contended answer earns.
+    private static final int RETRIES = 2;
 
     private final DisCasClient client;
     private final ReadConsistency watchConsistency;
     private final Duration watchPollPeriod;
     private final boolean ownsClient;
+    // Terminal once set, whoever owns the client: a store closed over a shared client must not go on
+    // answering, and what is still outstanding through it is ended rather than left to the client.
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final Set<CompletableFuture<?>> outstanding = ConcurrentHashMap.newKeySet();
 
     /**
      * Wraps a client whose lifecycle stays with the caller. A discas client is meant to be long-lived
@@ -76,9 +74,17 @@ public final class DiscasCoordinationStore implements CoordinationStore {
      * <p>Watches read {@link ReadConsistency#LINEARIZABLE} by default, and deliberately: the value a
      * watch returns is <b>acted on</b> here -- a changed designation revokes a run in flight -- so a
      * stale read would stop the wrong one. Each poll is then a consensus round, which for the handful
-     * of keys piplex watches is a round a second and nothing to worry about. Drop it to
-     * {@link ReadConsistency#SERIALIZABLE} only if the number of parked waiters ever makes that untrue,
-     * and accept being a moment late.
+     * of keys piplex watches is a round a second and nothing to worry about.
+     *
+     * <p>{@link ReadConsistency#SERIALIZABLE} is accepted, and it is not the cost knob it looks like.
+     * This is one value for the whole store, so lowering it lowers <b>every</b> watch taken through it,
+     * including the two an admitted run holds -- and those are exactly the ones which act on what came
+     * back rather than reading again. A stale answer there revokes a run late, and late is the window
+     * in which two controllers both believe they own the work. The knob for cost is
+     * {@code watchPollPeriod}, on the constructor below: it buys the saving only where lateness is
+     * harmless, and by an amount written down in a field instead of by however far behind the node
+     * that answered happens to be. The Jenkins plugin passes {@code LINEARIZABLE} and offers no field
+     * for this.
      *
      * @param client           the client
      * @param watchConsistency how {@link #awaitChange} reads
@@ -96,19 +102,22 @@ public final class DiscasCoordinationStore implements CoordinationStore {
      *
      * <p>A watch in discas is a poll, not a subscription, and {@code watchPollPeriod} is how long the
      * client waits after one poll answered before making the next -- the gap actually taken is spread
-     * up to five times it. Left unset, the client's own setting decides, and that is the right default
-     * for two reasons: the client-wide setting is the only one allowed below
-     * {@link DisCasClient#MIN_WATCH_POLL_PERIOD}, and passing a period from here unconditionally would
-     * quietly override an operator who had deliberately made that whole-client decision.
+     * up to five times it. It applies to {@link Watch#BACKGROUND background} watches only: a parked
+     * candidate's and a milestone waiter's, which re-read on their own schedule anyway. An admitted
+     * run's watches are {@link Watch#URGENT urgent} -- it stops on what they return -- and always poll
+     * at the client's own period, so raising this never makes a {@code disable} slower to stop a run.
      *
-     * <p>Set it when the number of watches makes their cost worth governing from the store rather than
-     * from the client. There are more of them than there look: a parked candidate races three at once,
-     * and an admitted run holds up to two more for as long as it runs. At
+     * <p>Left unset, the client's own setting decides, and that is the right default for two reasons:
+     * the client-wide setting is the only one allowed below {@link DisCasClient#MIN_WATCH_POLL_PERIOD},
+     * and passing a period from here unconditionally would quietly override an operator who had
+     * deliberately made that whole-client decision.
+     *
+     * <p>Set it when parked candidates are many or wait long: each races three watches at once, and at
      * {@link ReadConsistency#LINEARIZABLE} every poll of every one of them is a consensus round.
      *
      * @param client           the client
      * @param watchConsistency how {@link #awaitChange} reads
-     * @param watchPollPeriod  the shortest gap between polls of a watch, at least
+     * @param watchPollPeriod  the shortest gap between polls of a background watch, at least
      *                         {@link DisCasClient#MIN_WATCH_POLL_PERIOD}, or {@code null} to leave it
      *                         to the client's own configuration
      * @param ownsClient       whether {@link #close()} should close the client too. A discas client is
@@ -136,37 +145,51 @@ public final class DiscasCoordinationStore implements CoordinationStore {
 
     @Override
     public CompletionStage<Entry> get(final String key) {
-        return client.get(key).thenApply(DiscasCoordinationStore::entryOf);
+        return open(() -> client.get(key).thenApply(DiscasCoordinationStore::entryOf));
     }
 
     @Override
     public CompletionStage<Boolean> compareAndSet(final String key,
                                                   final String expectedVersion,
                                                   final String value) {
-        return client.cas(key, versionOf(expectedVersion), value).thenApply(result -> result.swapped());
+        return open(() -> client.cas(key, versionOf(expectedVersion), value).thenApply(result -> result.swapped()));
+    }
+
+    /**
+     * Waits as an {@link Watch#URGENT urgent} watch: a caller which does not say is assumed to act on
+     * what comes back.
+     */
+    @Override
+    public CompletionStage<Entry> awaitChange(final String key,
+                                              final String sinceVersion,
+                                              final Duration maxWait) {
+        return awaitChange(key, sinceVersion, maxWait, Watch.URGENT);
     }
 
     @Override
     public CompletionStage<Entry> awaitChange(final String key,
                                               final String sinceVersion,
-                                              final Duration maxWait) {
-        final Version since = versionOf(sinceVersion);
-        final CompletionStage<WatchResult> watched = watchPollPeriod == null
-                ? client.watch(key, since, maxWait, watchConsistency)
-                : client.watch(key, since, maxWait, watchConsistency, watchPollPeriod);
-        return watched.thenApply(DiscasCoordinationStore::entryOf);
+                                              final Duration maxWait,
+                                              final Watch watch) {
+        return open(() -> {
+            final Version since = versionOf(sinceVersion);
+            final CompletionStage<WatchResult> watched = watchPollPeriod == null || watch != Watch.BACKGROUND
+                    ? client.watch(key, since, maxWait, watchConsistency)
+                    : client.watch(key, since, maxWait, watchConsistency, watchPollPeriod);
+            return watched.thenApply(DiscasCoordinationStore::entryOf);
+        });
     }
 
     @Override
     public CompletionStage<LeaseAttempt> tryAcquire(final String key,
                                                     final String ownerId,
                                                     final Duration ttl) {
-        return attempt(key, ownerId, ttl, true);
+        return open(() -> attempt(key, ownerId, ttl, true));
     }
 
     @Override
     public CompletionStage<Boolean> renew(final String key, final LeaseHandle handle, final Duration ttl) {
-        return renew(key, DiscasLeaseHandle.tokenOf(handle), ttl, true);
+        return open(() -> renew(key, DiscasLeaseHandle.tokenOf(handle), ttl, true));
     }
 
     private CompletionStage<Boolean> renew(final String key,
@@ -181,20 +204,27 @@ public final class DiscasCoordinationStore implements CoordinationStore {
         // stopping a run because a bystander read the key would be the worst answer available.
         //
         // So it is asked again, once, which is what re-reading and deciding again amounts to -- the
-        // second call reads afresh and comes back with a definite APPLIED, EXPIRED or HELD_BY_OTHER.
-        // Once and not in a loop: a renew that keeps losing has a busy key, and when to look again is
-        // the keep-alive timer's question.
+        // second call usually comes back with a definite APPLIED, EXPIRED or HELD_BY_OTHER. Once and
+        // not in a loop: a renew that keeps losing has a busy key, and when to look again is the
+        // keep-alive timer's question.
+        //
+        // Twice contended is still nothing known to be lost, so it is not false either: false is this
+        // interface's way of saying the lease is gone. It is a failure instead, which is what the
+        // caller already treats as "the outcome could not be learnt".
         return client.renewLock(key, token, ttl).thenCompose(result -> {
-            if (lastChance && result.status() == LockWriteStatus.CONTENDED) {
+            if (result.status() != LockWriteStatus.CONTENDED) {
+                return completed(result.applied());
+            }
+            if (lastChance) {
                 return renew(key, token, ttl, false);
             }
-            return completed(result.applied());
+            return CompletableFuture.<Boolean>failedFuture(new ContendedException(key, RETRIES));
         });
     }
 
     @Override
     public CompletionStage<Void> release(final String key, final LeaseHandle handle) {
-        return release(key, DiscasLeaseHandle.tokenOf(handle), true);
+        return open(() -> release(key, DiscasLeaseHandle.tokenOf(handle), true));
     }
 
     private CompletionStage<Void> release(final String key,
@@ -202,22 +232,72 @@ public final class DiscasCoordinationStore implements CoordinationStore {
                                           final boolean lastChance) {
         // CONTENDED matters here for the same reason as in renew and with a cost of its own: a
         // release that did not land leaves the lease standing until it lapses, and the next run
-        // waits out a lease nobody is holding. Asked again, once. Every other answer is done --
+        // waits out a lease nobody is holding. Asked again, once, and said out loud when that is
+        // contended too rather than answered as a release that happened. Every other answer is done --
         // releasing a lease already lapsed or already released is not an error, and one taken over
         // is no longer this caller's to end.
         return client.release(key, token).thenCompose(result -> {
-            if (lastChance && result.status() == LockWriteStatus.CONTENDED) {
+            if (result.status() != LockWriteStatus.CONTENDED) {
+                return completed((Void) null);
+            }
+            if (lastChance) {
                 return release(key, token, false);
             }
-            return completed(null);
+            return CompletableFuture.<Void>failedFuture(new ContendedException(key, RETRIES));
         });
     }
 
     @Override
     public void close() {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
+        for (final CompletableFuture<?> call : outstanding) {
+            call.completeExceptionally(closedStore());
+        }
         if (ownsClient) {
             client.close();
         }
+    }
+
+    /**
+     * Makes a call only while the store is open, and keeps it where {@link #close()} can end it.
+     *
+     * @param call the call to make
+     * @param <T>  what it answers with
+     * @return its answer, or a failure once the store is closed
+     */
+    private <T> CompletionStage<T> open(final Supplier<CompletionStage<T>> call) {
+        if (closed.get()) {
+            return CompletableFuture.failedFuture(closedStore());
+        }
+        final CompletableFuture<T> answer = new CompletableFuture<>();
+        outstanding.add(answer);
+        answer.whenComplete((ignored, error) -> outstanding.remove(answer));
+        // Closed between the check and the add: close() may have missed this one.
+        if (closed.get()) {
+            answer.completeExceptionally(closedStore());
+            return answer;
+        }
+        final CompletionStage<T> made;
+        try {
+            made = call.get();
+        } catch (final RuntimeException thrown) {
+            answer.completeExceptionally(thrown);
+            return answer;
+        }
+        made.whenComplete((value, error) -> {
+            if (error != null) {
+                answer.completeExceptionally(error);
+            } else {
+                answer.complete(value);
+            }
+        });
+        return answer;
+    }
+
+    private static IllegalStateException closedStore() {
+        return new IllegalStateException("The store is closed");
     }
 
     // lastChance is the whole retry policy: an answer saying the key is free -- an acquire that lost
@@ -286,10 +366,10 @@ public final class DiscasCoordinationStore implements CoordinationStore {
                                                final String ownerId,
                                                final Duration ttl,
                                                final boolean lastChance) {
-        // Nobody holds the key. One more attempt if one is left, and otherwise contention with no name.
+        // Nobody holds the key. One more attempt if one is left, and otherwise contention with no holder.
         return lastChance
                 ? attempt(key, ownerId, ttl, false)
-                : completed(new LeaseAttempt.HeldByOther(null, null));
+                : completed(new LeaseAttempt.Contended());
     }
 
     private static CompletionStage<LeaseAttempt> contended(final String key, final LockInfo observed) {
@@ -314,19 +394,19 @@ public final class DiscasCoordinationStore implements CoordinationStore {
 
     private static IllegalStateException notALockRecord(final String key) {
         return new IllegalStateException(
-                "key '" + key + "' holds a value, not a lock record; keep leases under a "
+                "Key '" + key + "' holds a value, not a lock record; keep leases under a "
                         + "prefix of their own");
     }
 
     private static IllegalStateException noHolderNamed(final String key) {
         return new IllegalStateException(
-                "key '" + key + "' was reported held by another owner but no holder was named; "
-                        + "this adapter needs discas 0.0.2 or later");
+                "Key '" + key + "' was reported held by another owner but no holder was named; "
+                        + "this adapter needs discas 0.0.4 or later");
     }
 
     private static IllegalStateException unexpected(final String key, final LockAcquireResult result) {
         return new IllegalStateException(
-                "unexpected lock status " + result.status() + " for key '" + key + "'");
+                "Unexpected lock status " + result.status() + " for key '" + key + "'");
     }
 
     private static <T> CompletionStage<T> completed(final T value) {
@@ -356,7 +436,12 @@ public final class DiscasCoordinationStore implements CoordinationStore {
     }
 
     private static Entry entryOf(final WatchResult result) {
-        return entryOf(result.exists(), result.value(), result.version());
+        final Entry entry = entryOf(result.exists(), result.value(), result.version());
+        // A watch whose late polls all failed answers with the newest thing any of them saw, which is
+        // up to a whole watch window old. Right for a caller waiting to be told when to look again, and
+        // no evidence at all for one counting how long since it could read the key -- so the difference
+        // is carried across rather than flattened here.
+        return result.confirmed() ? entry : Entry.unconfirmed(entry);
     }
 
     private static Entry entryOf(final boolean exists, final ByteBuffer value, final Version version) {

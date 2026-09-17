@@ -48,8 +48,13 @@ import java.util.Map;
  * commands -- then:
  *
  * <pre>
- * DiscasStoreExample euc1-blue eod n1=127.0.0.1:7001 n2=127.0.0.1:7002 n3=127.0.0.1:7003
+ * ./gradlew :piplex-example:run -PmainClass=DiscasStoreExample \
+ *         --args="euc1-blue eod n1=127.0.0.1:7101 n2=127.0.0.1:7102 n3=127.0.0.1:7103"
  * </pre>
+ *
+ * <p>Those are the nodes' <b>client</b> ports, which is what {@code --client-bind} sets and what every
+ * {@code nodes} setting in the guides names. The port in {@code --members} is the one the nodes reach
+ * each other on, and a client pointed at it finds a consensus port that will not talk to it.
  */
 public final class DiscasStoreExample {
 
@@ -61,7 +66,7 @@ public final class DiscasStoreExample {
      */
     public static void main(final String[] args) {
         if (args.length < 3) {
-            Examples.say("usage: DiscasStoreExample <clientId> <key> <nodeId=host:port>...");
+            Examples.say("Usage: DiscasStoreExample <clientId> <key> <nodeId=host:port>...");
             return;
         }
         final ClientId clientId = ClientId.of(args[0]);
@@ -93,19 +98,28 @@ public final class DiscasStoreExample {
     private static Map<NodeId, InetSocketAddress> nodes(final String[] args) {
         final Map<NodeId, InetSocketAddress> nodes = new LinkedHashMap<>();
         for (int i = 2; i < args.length; i++) {
-            final String[] parts = args[i].split("[=:]");
-            if (parts.length != 3) {
-                throw new IllegalArgumentException("expected nodeId=host:port, got: " + args[i]);
+            final String entry = args[i];
+            final int equals = entry.indexOf('=');
+            // The last colon rather than every one, and brackets unwrapped: an IPv6 literal is mostly
+            // colons, and bracketed is the only way to write one a host:port can be read out of. The
+            // same reading as the Jenkins settings field, so one form of an address is documented.
+            final int colon = entry.lastIndexOf(':');
+            if (equals < 1 || colon < equals + 2 || colon == entry.length() - 1
+                    || colon < entry.lastIndexOf(']')) {
+                throw new IllegalArgumentException("Expected nodeId=host:port, got: " + entry);
             }
-            nodes.put(NodeId.of(parts[0]),
-                    new InetSocketAddress(parts[1], Integer.parseInt(parts[2])));
+            final String host = entry.substring(equals + 1, colon);
+            nodes.put(NodeId.of(entry.substring(0, equals)),
+                    new InetSocketAddress(host.startsWith("[") && host.endsWith("]")
+                                    ? host.substring(1, host.length() - 1) : host,
+                            Integer.parseInt(entry.substring(colon + 1))));
         }
         return nodes;
     }
 
     private static String describe(final Designation designation) {
         return designation.owner() + " (change #" + designation.seq()
-                + ", by " + designation.by() + ", " + designation.reason() + ")";
+                + ", " + designation.reason() + " at " + designation.at() + ")";
     }
 
     private static String describe(final Milestone milestone) {

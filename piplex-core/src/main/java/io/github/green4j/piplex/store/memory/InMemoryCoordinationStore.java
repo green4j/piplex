@@ -25,8 +25,8 @@ import java.util.concurrent.CompletionStage;
 /**
  * A store which keeps everything in this JVM, for tests and for running an example without a cluster.
  *
- * <p>It is deliberately faithful about the two things which are easy to get wrong against a real store,
- * because code which passes here and fails there is worse than no fake at all:
+ * <p>It is deliberately faithful about the three things which are easy to get wrong against a real
+ * store, because code which passes here and fails there is worse than no fake at all:
  *
  * <ul>
  *   <li><b>Waiting coalesces.</b> Several writes while a caller waits report only the latest state.
@@ -34,6 +34,9 @@ import java.util.concurrent.CompletionStage;
  *   <li><b>A lease lapses by elapsed time, not by a timer.</b> Expiry is decided when somebody looks,
  *       exactly as a real store decides it, so an expired holder learns of it on its next call and not
  *       a moment sooner.</li>
+ *   <li><b>A key holds a value or a lease, never both.</b> Two maps here would happily hold both;
+ *       discas refuses it, because a record is one kind of thing. Code which puts a lease on a key it
+ *       also writes passes against two maps and fails against a cluster.</li>
  * </ul>
  *
  * <p>Time comes from the {@link TimeSource} handed in, so a test drives lease expiry and a four-hour park
@@ -47,6 +50,7 @@ public final class InMemoryCoordinationStore implements CoordinationStore {
     private final Map<String, Lease> leases = new HashMap<>();
     private final List<Waiter> waiters = new ArrayList<>();
     private final TimeSource time;
+    private boolean closed;
 
     /**
      * @param time where elapsed time comes from, and how a wait is timed out
@@ -58,6 +62,9 @@ public final class InMemoryCoordinationStore implements CoordinationStore {
     @Override
     public CompletionStage<Entry> get(final String key) {
         synchronized (monitor) {
+            if (closed) {
+                return closed();
+            }
             return CompletableFuture.completedFuture(entryOf(key));
         }
     }
@@ -69,6 +76,12 @@ public final class InMemoryCoordinationStore implements CoordinationStore {
         final List<Waiter> due;
         final Entry after;
         synchronized (monitor) {
+            if (closed) {
+                return closed();
+            }
+            if (leaseHeld(key)) {
+                throw notALockRecord(key);
+            }
             final Value current = values.get(key);
             final String version = current == null ? INITIAL_VERSION : current.version;
             if (!version.equals(expectedVersion)) {
@@ -93,6 +106,9 @@ public final class InMemoryCoordinationStore implements CoordinationStore {
         final CompletableFuture<Entry> result = new CompletableFuture<>();
         final Waiter waiter;
         synchronized (monitor) {
+            if (closed) {
+                return closed();
+            }
             final Entry now = entryOf(key);
             if (!now.version().equals(sinceVersion)) {
                 return CompletableFuture.completedFuture(now);
@@ -119,6 +135,12 @@ public final class InMemoryCoordinationStore implements CoordinationStore {
                                                     final String ownerId,
                                                     final Duration ttl) {
         synchronized (monitor) {
+            if (closed) {
+                return closed();
+            }
+            if (values.containsKey(key)) {
+                throw notAValue(key);
+            }
             final Lease held = leases.get(key);
             if (held != null && !time.deadlinePassed(held.expiresAtNanos)) {
                 final Duration left = time.until(held.expiresAtNanos);
@@ -139,6 +161,9 @@ public final class InMemoryCoordinationStore implements CoordinationStore {
     @Override
     public CompletionStage<Boolean> renew(final String key, final LeaseHandle handle, final Duration ttl) {
         synchronized (monitor) {
+            if (closed) {
+                return closed();
+            }
             final Lease held = leases.get(key);
             if (held == null || !held.handle.equals(handle) || time.deadlinePassed(held.expiresAtNanos)) {
                 return CompletableFuture.completedFuture(Boolean.FALSE);
@@ -151,6 +176,9 @@ public final class InMemoryCoordinationStore implements CoordinationStore {
     @Override
     public CompletionStage<Void> release(final String key, final LeaseHandle handle) {
         synchronized (monitor) {
+            if (closed) {
+                return closed();
+            }
             final Lease held = leases.get(key);
             if (held != null && held.handle.equals(handle)) {
                 // Kept, not removed: the fencing token has to keep climbing across releases, or it
@@ -165,6 +193,8 @@ public final class InMemoryCoordinationStore implements CoordinationStore {
     public void close() {
         final List<Waiter> abandoned;
         synchronized (monitor) {
+            // Terminal: a store answering from a wiped state would start the fencing sequence over.
+            closed = true;
             values.clear();
             leases.clear();
             abandoned = List.copyOf(waiters);
@@ -174,7 +204,29 @@ public final class InMemoryCoordinationStore implements CoordinationStore {
         // A real client closing ends its outstanding requests, and a waiter left holding a future that
         // will never complete is a test that hangs instead of one that says what went wrong.
         abandoned.forEach(waiter -> waiter.result.completeExceptionally(
-                new IllegalStateException("the store was closed while waiting for '" + waiter.key + "'")));
+                new IllegalStateException("The store was closed while waiting for '" + waiter.key + "'")));
+    }
+
+    // A released lease is kept, as an expired one, so that the fencing token goes on climbing -- so a
+    // key which once held a lease is not a key which holds one. What a write collides with is a lease
+    // somebody could still be acting under.
+    private boolean leaseHeld(final String key) {
+        final Lease held = leases.get(key);
+        return held != null && !time.deadlinePassed(held.expiresAtNanos);
+    }
+
+    private static <T> CompletionStage<T> closed() {
+        return CompletableFuture.failedFuture(new IllegalStateException("The store is closed"));
+    }
+
+    private static IllegalStateException notALockRecord(final String key) {
+        return new IllegalStateException("Key '" + key + "' holds a lock record, not a value; keep "
+                + "leases under a prefix of their own");
+    }
+
+    private static IllegalStateException notAValue(final String key) {
+        return new IllegalStateException("Key '" + key + "' holds a value, not a lock record; keep "
+                + "leases under a prefix of their own");
     }
 
     private Entry entryOf(final String key) {

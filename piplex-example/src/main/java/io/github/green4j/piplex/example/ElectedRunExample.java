@@ -25,7 +25,7 @@ import java.time.Duration;
  * deployment, because two runs on one controller are exactly as wrong as two runs on two, and the lease
  * has to refuse them both.
  *
- * <p>Run it: {@code ./gradlew :piplex-example:run -PmainClass=...ElectedRunExample}, or from an IDE.
+ * <p>Run it: {@code ./gradlew :piplex-example:run -PmainClass=ElectedRunExample}, or from an IDE.
  */
 public final class ElectedRunExample {
 

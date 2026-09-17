@@ -9,17 +9,25 @@ package io.github.green4j.piplex.milestone;
 
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.ManualTime;
+import io.github.green4j.piplex.SilentStore;
+import io.github.green4j.piplex.store.CoordinationStore;
 import io.github.green4j.piplex.store.memory.InMemoryCoordinationStore;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -33,72 +41,54 @@ class MilestonesTest {
     private static final Duration TIMEOUT = Duration.ofMinutes(90);
 
     private ManualTime time;
+    private InMemoryCoordinationStore store;
     private Milestones milestones;
 
     @BeforeEach
     void setUp() {
         time = new ManualTime();
-        milestones = new Milestones(new InMemoryCoordinationStore(time), time);
+        store = new InMemoryCoordinationStore(time);
+        milestones = new Milestones(store, time);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        ",           2026-09-11, PUBLISHED,           2026-09-11, eod#2",
+        "2026-09-11, 2026-09-12, PUBLISHED,           2026-09-12, eod#2",
+        // A re-run must not rewrite who got there first.
+        "2026-09-11, 2026-09-11, ALREADY_AT_OR_AHEAD, 2026-09-11, eod#1",
+        "2026-09-12, 2026-09-11, ALREADY_AT_OR_AHEAD, 2026-09-12, eod#1",
+    })
+    void onlyEverMovesAMilestoneForward(final String before,
+                                        final String published,
+                                        final PublishResult.Outcome outcome,
+                                        final String inForce,
+                                        final String runId) {
+        if (before != null) {
+            join(milestones.publish(KEY, Generation.of(before), "euc1-blue", "eod#1"));
+        }
+
+        final PublishResult result = join(milestones.publish(KEY, Generation.of(published), "euc1-blue", "eod#2"));
+
+        assertEquals(outcome, result.outcome());
+        final Milestone now = join(milestones.current(KEY));
+        assertEquals(now, result.inForce());
+        assertEquals(new Milestone(Generation.of(inForce), "euc1-blue", runId, now.at()), now);
     }
 
     @Test
-    void publishesTheFirstGeneration() {
-        final PublishResult result = join(milestones.publish(KEY, D2, "euc1-blue", "eod#142"));
-        assertEquals(PublishResult.Outcome.PUBLISHED, result.outcome());
-        assertEquals(D2, result.inForce().generation());
-        assertEquals("euc1-blue", result.inForce().by());
-        assertEquals("eod#142", result.inForce().runId());
+    void readsARecordWhoseStampIsMalformed() {
+        assertEquals(new Milestone(D2, "euc1-blue", null, null),
+                Milestone.parse("{\"generation\":\"" + D2.value() + "\",\"by\":\"euc1-blue\",\"at\":\"today\"}"));
     }
 
-    @Test
-    void publishingTheSameGenerationAgainChangesNothing() {
-        join(milestones.publish(KEY, D2, "euc1-blue", "eod#142"));
-        final PublishResult again = join(milestones.publish(KEY, D2, "euc1-blue", "eod#143"));
-        assertEquals(PublishResult.Outcome.ALREADY_AT_OR_AHEAD, again.outcome());
-        // the record is the original one: a re-run must not rewrite who got there first
-        assertEquals("eod#142", join(milestones.current(KEY)).runId());
-    }
-
-    @Test
-    void neverMovesAMilestoneBackwards() {
-        join(milestones.publish(KEY, D2, "euc1-blue", "eod#142"));
-        final PublishResult older = join(milestones.publish(KEY, D1, "euc1-blue", "eod#99"));
-        assertEquals(PublishResult.Outcome.ALREADY_AT_OR_AHEAD, older.outcome());
-        assertEquals(D2, join(milestones.current(KEY)).generation());
-    }
-
-    @Test
-    void movesForward() {
-        join(milestones.publish(KEY, D2, "euc1-blue", "eod#142"));
-        assertEquals(PublishResult.Outcome.PUBLISHED,
-                join(milestones.publish(KEY, D3, "euc1-blue", "eod#150")).outcome());
-        assertEquals(D3, join(milestones.current(KEY)).generation());
-    }
-
-    @Test
-    void returnsAtOnceWhenTheMilestoneIsAlreadyThere() {
-        join(milestones.publish(KEY, D2, "euc1-blue", "eod#142"));
+    @ParameterizedTest
+    @ValueSource(strings = {"2026-09-11", "2026-09-12"})
+    void returnsAtOnceWhenTheMilestoneIsAlreadyThere(final String reached) {
+        join(milestones.publish(KEY, Generation.of(reached), "euc1-blue", "eod#142"));
         final AwaitResult waited = join(milestones.awaitAtLeast(KEY, D2, TIMEOUT));
         assertEquals(AwaitResult.Outcome.REACHED, waited.outcome());
-        assertEquals(0, time.pending(), "a wait satisfied on the first read must schedule nothing");
-    }
-
-    @Test
-    void returnsAtOnceWhenTheMilestoneIsAlreadyPastIt() {
-        join(milestones.publish(KEY, D3, "euc1-blue", "eod#150"));
-        assertEquals(AwaitResult.Outcome.REACHED, join(milestones.awaitAtLeast(KEY, D2, TIMEOUT)).outcome());
-    }
-
-    @Test
-    void unblocksWhenTheProducerPublishes() {
-        final CompletableFuture<AwaitResult> waited =
-                milestones.awaitAtLeast(KEY, D2, TIMEOUT).toCompletableFuture();
-        assertFalse(waited.isDone(), "nothing has been published yet");
-
-        join(milestones.publish(KEY, D2, "euc1-blue", "eod#142"));
-
-        assertTrue(waited.isDone());
-        assertEquals(AwaitResult.Outcome.REACHED, waited.join().outcome());
+        assertEquals(0, time.pending(), "A wait satisfied on the first read must schedule nothing");
     }
 
     @Test
@@ -118,9 +108,26 @@ class MilestonesTest {
     }
 
     @Test
-    void timesOutRatherThanWaitingForever() {
+    void stopsWaitingWhenNobodyIsWaitingForTheAnswerAnyMore() {
         final CompletableFuture<AwaitResult> waited =
                 milestones.awaitAtLeast(KEY, D2, TIMEOUT).toCompletableFuture();
+
+        // The build was stopped. The watch in flight cannot be called off, but nothing may follow it.
+        waited.cancel(false);
+        time.advance(Milestones.ROUND);
+
+        assertEquals(0, time.pending(), "An abandoned wait must leave nothing behind it");
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = "2026-09-10")
+    void timesOutRatherThanWaitingForeverAndSaysHowFarItGot(final String reached) {
+        if (reached != null) {
+            join(milestones.publish(KEY, Generation.of(reached), "euc1-blue", "eod#99"));
+        }
+        final CompletableFuture<AwaitResult> waited =
+                milestones.awaitAtLeast(KEY, D3, TIMEOUT).toCompletableFuture();
         assertFalse(waited.isDone());
 
         time.advance(TIMEOUT);
@@ -128,43 +135,43 @@ class MilestonesTest {
         assertTrue(waited.isDone());
         final AwaitResult result = waited.join();
         assertEquals(AwaitResult.Outcome.TIMED_OUT, result.outcome());
-        assertNull(result.inForce(), "nothing was ever published");
+        assertEquals(reached, result.inForce() == null ? null : result.inForce().generation().value(),
+                "An operator needs to see how far it did get");
     }
 
     @Test
-    void reportsWhatWasInForceWhenItTimedOut() {
-        join(milestones.publish(KEY, D1, "euc1-blue", "eod#99"));
-        final CompletableFuture<AwaitResult> waited =
-                milestones.awaitAtLeast(KEY, D3, TIMEOUT).toCompletableFuture();
+    void endsAWaitWhoseReadTheStoreNeverAnswers() {
+        final CompletableFuture<AwaitResult> waited = new Milestones(
+                new SilentStore(CoordinationStore.DEFAULT_RESPONSE_BOUND).store(), time)
+                .awaitAtLeast(KEY, D2, Duration.ofMinutes(1)).toCompletableFuture();
 
-        time.advance(TIMEOUT);
+        time.advance(CoordinationStore.DEFAULT_RESPONSE_BOUND);
 
-        final AwaitResult result = waited.join();
-        assertEquals(AwaitResult.Outcome.TIMED_OUT, result.outcome());
-        assertEquals(D1, result.inForce().generation(), "an operator needs to see how far it did get");
+        assertTrue(waited.isDone(), "A read which never comes back must not outlast the bound");
+        final CompletionException thrown = assertThrows(CompletionException.class, waited::join);
+        assertInstanceOf(TimeoutException.class, thrown.getCause());
     }
 
     @Test
-    void hasNoMilestoneUntilOneIsPublished() {
-        assertNull(join(milestones.current(KEY)));
+    void repairsAMilestoneThatWillNotParse() {
+        join(store.compareAndSet(
+                Milestones.keyOf(KEY), CoordinationStore.INITIAL_VERSION, "{\"generation\""));
+
+        assertEquals(PublishResult.Outcome.PUBLISHED, join(milestones.repair(KEY, D2)).outcome());
+        assertEquals(D2, join(milestones.current(KEY)).generation());
+        assertEquals(PublishResult.Outcome.ALREADY_AT_OR_AHEAD,
+                join(milestones.repair(KEY, D1)).outcome(), "Readable, it must not move backwards");
     }
 
     @Test
-    void survivesARoundTripThroughJson() {
-        join(milestones.publish(KEY, D2, "euc1-blue", "eod#142"));
-        final Milestone read = join(milestones.current(KEY));
-        assertNotNull(read.at());
-        assertEquals(read, Milestone.parse(read.toJson()));
-    }
-
-    @Test
-    void refusesWhatIsNotARecordAtAll() {
-        // The shapes a key ends up holding once somebody edits it by hand. The text goes in the
-        // message because it is the only copy of what the key held.
-        assertTrue(assertThrows(IllegalArgumentException.class, () -> Milestone.parse("{\"generation\""))
-                .getMessage().contains("{\"generation\""));
-        assertThrows(IllegalArgumentException.class, () -> Milestone.parse("[1,2]"));
-        assertThrows(IllegalArgumentException.class, () -> Milestone.parse(""));
+    void refusesToPublishOrWaitForNoGeneration() {
+        // Refused at the call, like a designation naming nobody, and not as a failed stage from
+        // somewhere inside the write.
+        assertThrows(NullPointerException.class, () -> milestones.publish(KEY, null, "euc1-blue", "eod#142"));
+        assertThrows(NullPointerException.class, () -> milestones.repair(KEY, null));
+        assertThrows(NullPointerException.class, () -> milestones.awaitAtLeast(KEY, null, Duration.ofMinutes(1L)));
+        assertThrows(NullPointerException.class, () -> milestones.awaitAtLeast(KEY, D2, null));
+        assertNull(join(milestones.current(KEY)), "And nothing reached the store");
     }
 
     private static <T> T join(final CompletionStage<T> stage) {

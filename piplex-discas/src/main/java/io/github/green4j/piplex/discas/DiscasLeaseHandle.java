@@ -40,6 +40,6 @@ record DiscasLeaseHandle(String ownerId, long fencingToken, LockToken token)
             return mine.token();
         }
         throw new IllegalArgumentException(
-                "this store only understands handles it issued, but got " + handle);
+                "This store only understands handles it issued, but got " + handle);
     }
 }

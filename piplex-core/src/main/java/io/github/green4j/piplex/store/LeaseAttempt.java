@@ -42,13 +42,18 @@ public sealed interface LeaseAttempt {
      * interval. Where it is reported it is still a hint: it decides when it is worth looking again, and
      * never whether somebody still owns something.
      *
-     * @param ownerId   who holds it, or {@code null} when the store cannot name a holder -- which it
-     *                  reports for the one case that is neither a grant nor a rival: the lease was
-     *                  free and the attempt still did not take it, because somebody else's write got
-     *                  there first and left it free again. Look again; there is nobody to wait for
+     * @param ownerId   who holds it; never {@code null} -- a lease nobody holds is {@link Contended}
      * @param remaining how much of their lease is left, or {@code null} when the store cannot say
      */
     record HeldByOther(String ownerId, Duration remaining) implements LeaseAttempt {
+    }
+
+    /**
+     * Nobody holds the lease, and this attempt still did not take it: somebody else's write got there
+     * first and left it free again. Neither a grant nor a rival -- look again, there is nobody to wait
+     * for.
+     */
+    record Contended() implements LeaseAttempt {
     }
 
     /**

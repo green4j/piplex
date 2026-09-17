@@ -13,8 +13,8 @@ import io.github.green4j.piplex.observe.TextPiplexObserver;
 import io.github.green4j.piplex.store.CoordinationStore;
 import io.github.green4j.piplex.store.memory.InMemoryCoordinationStore;
 
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -31,16 +31,22 @@ import java.util.concurrent.TimeUnit;
  */
 final class Controllers implements AutoCloseable {
 
-    private final ScheduledExecutorService scheduler =
-            Executors.newScheduledThreadPool(2, runnable -> {
-                final Thread thread = new Thread(runnable, "piplex-example");
-                thread.setDaemon(true);
-                return thread;
-            });
+    private final ScheduledExecutorService scheduler = scheduler();
 
     private final TimeSource time = TimeSource.of(scheduler);
     private final CoordinationStore store;
     private final boolean ownsStore;
+
+    private static ScheduledExecutorService scheduler() {
+        final ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(2, runnable -> {
+            final Thread thread = new Thread(runnable, "piplex-example");
+            thread.setDaemon(true);
+            return thread;
+        });
+        // A cancelled timer is otherwise kept until it would have fired.
+        executor.setRemoveOnCancelPolicy(true);
+        return executor;
+    }
 
     Controllers() {
         this.store = new InMemoryCoordinationStore(time);

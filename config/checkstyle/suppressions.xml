@@ -3,4 +3,6 @@
         "-//Puppy Crawl//DTD Suppressions 1.0//EN"
         "http://www.puppycrawl.com/dtds/suppressions_1_0.dtd">
 <suppressions>
+    <!-- Test pipeline steps: Stapler instantiates them only through a public constructor. -->
+    <suppress checks="RedundantModifier" files="[\\/]src[\\/]test[\\/].*[\\/]PiplexStepsTest\.java$"/>
 </suppressions>

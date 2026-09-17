@@ -32,7 +32,6 @@ import java.util.Objects;
  */
 public final class Piplex {
 
-    private final CoordinationStore store;
     private final ExclusiveRuns runs;
     private final Milestones milestones;
     private final Designations designations;
@@ -46,18 +45,11 @@ public final class Piplex {
     public Piplex(final CoordinationStore store,
                   final TimeSource time,
                   final PiplexObserver observer) {
-        this.store = Objects.requireNonNull(store, "store");
+        Objects.requireNonNull(store, "store");
         this.milestones = new Milestones(store, time, observer);
         this.runs = new ExclusiveRuns(store, time, observer);
-        this.designations = new Designations(store, time);
-        this.switches = new Switches(store);
-    }
-
-    /**
-     * @return the store everything here reads and writes
-     */
-    public CoordinationStore store() {
-        return store;
+        this.designations = new Designations(store, time, observer);
+        this.switches = new Switches(store, time, observer);
     }
 
     /**

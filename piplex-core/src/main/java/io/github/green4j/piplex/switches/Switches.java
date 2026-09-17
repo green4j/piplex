@@ -7,52 +7,90 @@
 
 package io.github.green4j.piplex.switches;
 
-import io.github.green4j.piplex.ContendedException;
+import io.github.green4j.piplex.TimeSource;
+import io.github.green4j.piplex.UnreadableKeyException;
+import io.github.green4j.piplex.observe.PiplexObserver;
+import io.github.green4j.piplex.store.CompareAndSetLoop;
+import io.github.green4j.piplex.store.CompareAndSetLoop.Step;
 import io.github.green4j.piplex.store.CoordinationStore;
+import io.github.green4j.piplex.store.FailFastStore;
 import io.github.green4j.piplex.store.Entry;
 
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 /**
- * The operator's side of a switch: reading whether work may run, and turning it off or back on.
+ * Reads and changes shared operational switches.
  *
- * <p>Turning work off is what an operator does during an incident or a migration, and today that is
- * done by commenting a schedule out of one deployment's configuration and redeploying it by hand. One
- * write here does the same thing, everywhere, in a second -- and, unlike the redeploy, it also stops a
- * run already in flight, through the same machinery that stops one whose owner changed.
- *
- * <p>An absent key means on. Switching off is always the deliberate act, so a store that has never been
- * written to, or one whose key somebody deleted, does not silently stop the work.
- *
- * <p>The record carries the reason and nothing else. Who flipped it and when belong to the door the
- * write went through -- the log of the job that made it -- not to a value the same client could write
- * anything into.
+ * <p>An absent key means enabled. Disabling a switch also revokes admitted runs that watch it. Writing
+ * the state already in force is a no-op and preserves its reason.
  */
 public final class Switches {
 
     private static final String PREFIX = "piplex/enabled/";
-    private static final int ATTEMPTS = 8;
+    private static final String OWNER_MARK = "/@";
 
     private final CoordinationStore store;
+    private final TimeSource time;
+    private final PiplexObserver observer;
 
     /**
      * @param store where switches are kept
+     * @param time  what times the store's answers and stamps the record
      */
-    public Switches(final CoordinationStore store) {
-        this.store = Objects.requireNonNull(store, "store");
+    public Switches(final CoordinationStore store, final TimeSource time) {
+        this(store, time, PiplexObserver.NONE);
+    }
+
+    /**
+     * @param store    where switches are kept
+     * @param time     what times the store's answers and stamps the record
+     * @param observer told when a switch is flipped
+     */
+    public Switches(final CoordinationStore store, final TimeSource time, final PiplexObserver observer) {
+        this.store = FailFastStore.of(store, time);
+        this.time = Objects.requireNonNull(time, "time");
+        this.observer = Objects.requireNonNull(observer, "observer");
     }
 
     /**
      * Where a switch is kept, for an operator reading the store by hand.
      *
-     * @param key the switch; a key of the form {@code <work>/<owner>} is how one deployment alone is
-     *            drained, and is a plain key like any other
+     * <p>Every way into this class goes through here, which is why the key is checked here: a blank one
+     * does not fail, it names the prefix itself, and then one write drains the whole controller.
+     *
+     * @param key the switch
      * @return the key it is held at
+     * @throws IllegalArgumentException if the key is null or blank
      */
     public static String keyOf(final String key) {
+        if (key == null || key.isBlank()) {
+            throw new IllegalArgumentException("key must not be blank");
+        }
         return PREFIX + key;
+    }
+
+    /**
+     * The switch that drains one deployment alone.
+     *
+     * <p>A run which consults {@code key} consults this one too, under its own owner, and goes on only
+     * while both are on. The {@code @} keeps it apart from the work switches under {@code key}: a
+     * request may not consult a switch with a segment starting with one.
+     *
+     * @param key     the switch the work consults
+     * @param ownerId the deployment
+     * @return {@code <key>/@<ownerId>}, to pass wherever a switch is named
+     */
+    public static String ownerKey(final String key, final String ownerId) {
+        return key + OWNER_MARK + ownerId;
+    }
+
+    /**
+     * @param key a switch a request consults
+     * @return whether it has a segment only {@link #ownerKey} may write
+     */
+    public static boolean namesAnOwner(final String key) {
+        return key.startsWith("@") || key.contains(OWNER_MARK);
     }
 
     /**
@@ -62,17 +100,18 @@ public final class Switches {
      * @return what is in force, {@link Switch#ENABLED} when the key holds nothing
      */
     public CompletionStage<Switch> current(final String key) {
-        return store.get(keyOf(key)).thenApply(Switches::switchOf);
+        final String storeKey = keyOf(key);
+        return store.get(storeKey).thenApply(entry -> switchOf(storeKey, entry));
     }
 
     /**
      * Lets the work run again.
      *
      * @param key the switch
-     * @return what is in force afterwards
+     * @return what it was and what it is now
      */
-    public CompletionStage<Switch> enable(final String key) {
-        return set(key, Switch.ENABLED, ATTEMPTS);
+    public CompletionStage<SwitchChange> enable(final String key) {
+        return set(key, true, null, false);
     }
 
     /**
@@ -80,32 +119,61 @@ public final class Switches {
      *
      * @param key    the switch
      * @param reason why, which is what the stopped runs will say in their logs
-     * @return what is in force afterwards
+     * @return what it was and what it is now
      */
-    public CompletionStage<Switch> disable(final String key, final String reason) {
-        return set(key, new Switch(false, reason), ATTEMPTS);
+    public CompletionStage<SwitchChange> disable(final String key, final String reason) {
+        return set(key, false, reason, false);
     }
 
-    private CompletionStage<Switch> set(final String key, final Switch desired, final int attemptsLeft) {
+    /**
+     * Sets a switch as {@link #enable} and {@link #disable} do, and also replaces a value that does not
+     * parse.
+     *
+     * @param key     the switch
+     * @param enabled whether the work may run
+     * @param reason  why it is switched off, may be {@code null}
+     * @return what it was and what it is now
+     */
+    public CompletionStage<SwitchChange> repair(final String key, final boolean enabled, final String reason) {
+        return set(key, enabled, reason, true);
+    }
+
+    private CompletionStage<SwitchChange> set(final String key,
+                                              final boolean enabled,
+                                              final String reason,
+                                              final boolean overwriteUnreadable) {
         final String storeKey = keyOf(key);
-        return store.get(storeKey).thenCompose(entry -> {
-            final Switch inForce = switchOf(entry);
-            if (inForce.equals(desired)) {
-                return CompletableFuture.completedFuture(inForce);
+        return CompareAndSetLoop.write(store, storeKey, entry -> {
+            final Switch inForce = overwriteUnreadable
+                    ? readableOrNull(storeKey, entry)
+                    : switchOf(storeKey, entry);
+            if (inForce != null && inForce.enabled() == enabled) {
+                return Step.keep(new SwitchChange(inForce, inForce, false));
             }
-            return store.compareAndSet(storeKey, entry.version(), desired.toJson()).thenCompose(applied -> {
-                if (Boolean.TRUE.equals(applied)) {
-                    return CompletableFuture.completedFuture(desired);
-                }
-                if (attemptsLeft <= 1) {
-                    return CompletableFuture.failedFuture(new ContendedException(storeKey, ATTEMPTS));
-                }
-                return set(key, desired, attemptsLeft - 1);
+            final Switch next = new Switch(enabled, reason, time.wallTime());
+            return Step.write(next.toJson(), () -> {
+                observer.switched(key, enabled, reason);
+                return new SwitchChange(inForce, next, true);
             });
         });
     }
 
-    private static Switch switchOf(final Entry entry) {
-        return entry.exists() ? Switch.parse(entry.value()) : Switch.ENABLED;
+    private static Switch readableOrNull(final String storeKey, final Entry entry) {
+        try {
+            return switchOf(storeKey, entry);
+        } catch (final UnreadableKeyException overwritten) {
+            return null;
+        }
+    }
+
+    private static Switch switchOf(final String storeKey, final Entry entry) {
+        if (!entry.exists()) {
+            return Switch.ENABLED;
+        }
+        try {
+            return Switch.parse(entry.value());
+        } catch (final RuntimeException notReadable) {
+            throw new UnreadableKeyException(storeKey, "switch", notReadable);
+        }
     }
 }

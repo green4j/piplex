@@ -46,6 +46,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class DesignatedHandoverExample {
 
     private static final String KEY = "eod";
+    private static final String DESIGNATION = "eod-owner";
     private static final String MILESTONE = "data/euc1";
 
     private DesignatedHandoverExample() {
@@ -64,7 +65,7 @@ public final class DesignatedHandoverExample {
 
             Examples.say("=== Designated: the operator says which region is primary ===");
             final DesignationChange initial = Examples.await(operator.designations()
-                    .designate(KEY, "euc1-blue", "agudkov", "primary region"));
+                    .designate(DESIGNATION, "euc1-blue", "primary region"));
             Examples.say("Designated " + initial.inForce().owner() + ", change #" + initial.inForce().seq());
 
             // Frankfurt is designated, so it runs.
@@ -87,11 +88,11 @@ public final class DesignatedHandoverExample {
 
             Examples.say("--- Frankfurt goes down for maintenance; the operator moves the primary ---");
             final DesignationChange moved = Examples.await(operator.designations()
-                    .designate(KEY, "eus1-blue", "agudkov", "INC-4711, euc1 maintenance"));
+                    .designate(DESIGNATION, "eus1-blue", "INC-4711, euc1 maintenance"));
             Examples.say("Primary moved from " + moved.previous().owner()
                     + " to " + moved.inForce().owner() + ", change #" + moved.inForce().seq());
 
-            handover(revoked, why, holder, milanAsked, milan, today);
+            handover(revoked, why, holder, milanAsked, today);
         }
     }
 
@@ -99,25 +100,24 @@ public final class DesignatedHandoverExample {
                                  final AtomicReference<Revocation> why,
                                  final Admitted holder,
                                  final CompletionStage<Admission> milanAsked,
-                                 final Piplex milan,
                                  final Generation today) throws InterruptedException {
         if (!revoked.await(10L, TimeUnit.SECONDS)) {
-            throw new IllegalStateException("the holder was never revoked");
+            throw new IllegalStateException("The holder was never revoked");
         }
         Examples.say("Frankfurt's run was stopped: " + why.get().reason()
                 + ", now " + why.get().newOwner() + "; still holds it: " + holder.isHeld());
+        // Frankfurt's work has stopped, so its lease can go back and Milan need not wait it out.
+        Examples.await(holder.release());
 
         final Admitted taken = (Admitted) Examples.await(milanAsked);
         Examples.say("Milan stopped waiting and is running EOD, fencing token " + taken.fencingToken());
 
         // The milestone is published on success and only on success. Frankfurt's half-finished run
         // published nothing, so whatever waits on this milestone kept waiting rather than starting on
-        // a partial day -- which is the composition the two primitives are for.
-        final PublishResult published = Examples.await(
-                milan.milestones().publish(MILESTONE, today, "eus1-blue", "eod#77"));
+        // a partial day -- which is the composition the two primitives are for. Published while the
+        // lease is still held, then given back: the order completedWhen rests on.
+        final PublishResult published = Examples.await(taken.completeAndRelease());
         Examples.say("Milan published " + MILESTONE + " at " + today + ": " + published.outcome());
-
-        Examples.await(taken.release());
     }
 
     private static ExclusiveRequest request(final String ownerId,
@@ -126,7 +126,7 @@ public final class DesignatedHandoverExample {
         return ExclusiveRequest.builder(KEY)
                 .ownedBy(ownerId)
                 .runId(runId)
-                .designatedBy(KEY)          // read who is primary from piplex/designated/eod
+                .designatedBy(DESIGNATION) // read who is primary from piplex/designated/eod-owner
                 .generation(generation)     // which day's work this is
                 .completedWhen(MILESTONE)   // if that day is already published, there is nothing to do
                 .lease(Duration.ofSeconds(4))

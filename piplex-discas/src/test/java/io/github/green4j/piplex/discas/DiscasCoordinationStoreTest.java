@@ -7,11 +7,16 @@
 
 package io.github.green4j.piplex.discas;
 
+import io.github.green4j.discas.client.ClusterClock;
 import io.github.green4j.discas.client.DisCasClient;
 import io.github.green4j.discas.client.DisCasClientFactory;
 import io.github.green4j.discas.client.lock.LockInfoStatus;
 import io.github.green4j.discas.client.lock.LockValueCodec;
+import io.github.green4j.discas.client.transport.ClientTransport;
 import io.github.green4j.discas.client.transport.InProcessClientBootstrap;
+import io.github.green4j.discas.client.transport.InProcessClientTransport;
+import io.github.green4j.discas.common.EventLoop;
+import io.github.green4j.discas.common.client.ClientMessage;
 import io.github.green4j.discas.common.client.ReadConsistency;
 import io.github.green4j.discas.common.identity.ClientId;
 import io.github.green4j.discas.common.identity.ClusterId;
@@ -23,10 +28,13 @@ import io.github.green4j.discas.node.membership.InMemoryMembers;
 import io.github.green4j.discas.node.transport.InProcessPeerBootstrap;
 import io.github.green4j.discas.node.wal.FileWal;
 import io.github.green4j.discas.node.wal.StorageConfig;
+import io.github.green4j.piplex.ContendedException;
 import io.github.green4j.piplex.store.CoordinationStore;
+import io.github.green4j.piplex.store.CoordinationStoreContract;
 import io.github.green4j.piplex.store.Entry;
 import io.github.green4j.piplex.store.LeaseAttempt;
 import io.github.green4j.piplex.store.LeaseHandle;
+import io.github.green4j.piplex.store.Watch;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -42,8 +50,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -61,22 +71,27 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * what a linearizable read finds in the key. A fake would be asserting on the mapping of statuses
  * this test is trying to prove the client produces.
  */
-class DiscasCoordinationStoreTest {
+class DiscasCoordinationStoreTest extends CoordinationStoreContract {
 
     private static final ClusterId CLUSTER = ClusterId.of("piplex-test");
     private static final List<NodeId> NODE_IDS = List.of(NodeId.of("1"), NodeId.of("2"), NodeId.of("3"));
     private static final Duration TTL = Duration.ofSeconds(30);
+    private static final Duration SHORT_LEASE = Duration.ofSeconds(1);
+    private static final Duration SHORT_WAIT = Duration.ofSeconds(1);
     private static final long OP_TIMEOUT_SECONDS = 15L;
     private static final long READY_BUDGET_MS = 60_000L;
     private static final long PROBE_TIMEOUT_MS = 2_000L;
     private static final long POLL_INTERVAL_MS = 100L;
     /** Enough turns of the race for a write to land inside a read-then-write at least once. */
     private static final int RACE_ROUNDS = 60;
+    /** Enough writers on one key that a renewal loses the compare twice running rather than once. */
+    private static final int BYSTANDERS = 4;
 
     private static final List<DisCasNode> NODES = new ArrayList<>();
     private static final AtomicInteger KEYS = new AtomicInteger();
     /** Kept moving so a hand-written lapsed record never looks like the one already on the key. */
     private static final AtomicInteger LAPSED_GENERATIONS = new AtomicInteger();
+
 
     private static DisCasClient client;
     private static CoordinationStore store;
@@ -114,52 +129,41 @@ class DiscasCoordinationStoreTest {
         }
     }
 
-    @Test
-    void grantsALeaseAndTakesItBack() {
-        final String key = leaseKey();
-
-        final LeaseAttempt.Acquired taken =
-                assertInstanceOf(LeaseAttempt.Acquired.class, done(store.tryAcquire(key, "owner-a/run-1", TTL)));
-        assertEquals("owner-a/run-1", taken.handle().ownerId());
-        assertTrue(taken.remaining().compareTo(Duration.ZERO) > 0);
-
-        assertTrue(done(store.renew(key, taken.handle(), TTL)));
-        done(store.release(key, taken.handle()));
-
-        assertInstanceOf(LeaseAttempt.Acquired.class, done(store.tryAcquire(key, "owner-b/run-1", TTL)));
+    @Override
+    protected CoordinationStore subject() {
+        return store;
     }
 
-    @Test
-    void tellsTheHolderItAlreadyHoldsRatherThanRefusingIt() {
-        final String key = leaseKey();
-        final String owner = "owner-a/run-1";
-
-        final LeaseAttempt.Acquired first =
-                assertInstanceOf(LeaseAttempt.Acquired.class, done(store.tryAcquire(key, owner, TTL)));
-
-        // What an acquire whose outcome was never learned looks like on retry. discas answers
-        // HELD_BY_SELF and hands back no lock; the adapter names recoverLock to get one.
-        final LeaseAttempt.HeldBySelf mine =
-                assertInstanceOf(LeaseAttempt.HeldBySelf.class, done(store.tryAcquire(key, owner, TTL)));
-
-        assertEquals(owner, mine.handle().ownerId());
-        assertEquals(first.handle().fencingToken(), mine.handle().fencingToken());
-        assertTrue(mine.remaining().compareTo(Duration.ZERO) > 0);
+    @Override
+    protected CoordinationStore newStore() {
+        return new DiscasCoordinationStore(client, ReadConsistency.LINEARIZABLE, false);
     }
 
-    @Test
-    void recoversALeaseThatRenewsAndReleasesAsTheOriginalWould() {
-        final String key = leaseKey();
-        final String owner = "owner-a/run-1";
-        done(store.tryAcquire(key, owner, TTL));
+    @Override
+    protected String key(final String name) {
+        return "piplex-test/" + name + "-" + KEYS.incrementAndGet();
+    }
 
-        final LeaseHandle recovered =
-                assertInstanceOf(LeaseAttempt.HeldBySelf.class, done(store.tryAcquire(key, owner, TTL)))
-                        .handle();
+    @Override
+    protected Duration shortLease() {
+        return SHORT_LEASE;
+    }
 
-        assertTrue(done(store.renew(key, recovered, TTL)));
-        done(store.release(key, recovered));
-        assertInstanceOf(LeaseAttempt.Acquired.class, done(store.tryAcquire(key, "owner-b/run-1", TTL)));
+    @Override
+    protected Duration shortWait() {
+        return SHORT_WAIT;
+    }
+
+    // A compare fenced on a lease key's own version overwrites the lock record: telling the two apart
+    // would take a read first, and a linearizable read moves the version the write is fenced on.
+    @Override
+    protected boolean refusesAValueAtALeasesVersion() {
+        return false;
+    }
+
+    @Override
+    protected void letPass(final Duration duration) throws InterruptedException {
+        Thread.sleep(duration.toMillis());
     }
 
     /**
@@ -184,7 +188,58 @@ class DiscasCoordinationStoreTest {
             final CompletableFuture<?> bump = bumpVersionOf(key);
             final boolean extended = done(store.renew(key, handle, TTL));
             bump.join();
-            assertTrue(extended, "round " + round + ": the lease was never lost, only written past");
+            assertTrue(extended, "Round " + round + ": the lease was never lost, only written past");
+        }
+
+        assertEquals(LockInfoStatus.LOCKED, done(client.getLockInfo(key)).status());
+    }
+
+    /**
+     * The same race, turned up until the single retry is not enough either. Twice contended is still
+     * nothing written and nothing known to be lost, so what it must never come back as is {@code
+     * false}: that is this interface saying the lease is gone, and a live run reads it as an order to
+     * stop. Unknown is what it is, and unknown is a failure.
+     *
+     * <p>Staged with writers that keep bumping the key rather than one write per round, because a
+     * renew loses two compares running only while somebody is writing throughout both of them. How
+     * often that happens is the cluster's to decide, so the assertion is on every answer rather than
+     * on reaching the awkward one: whatever a bystander does, this lease is not lost.
+     */
+    @Test
+    void neverSaysALeaseIsLostWhileBystandersAreOnlyWritingPastIt() throws Exception {
+        final String key = leaseKey();
+        final LeaseHandle handle =
+                assertInstanceOf(LeaseAttempt.Acquired.class, done(store.tryAcquire(key, "owner-a/run-1", TTL)))
+                        .handle();
+
+        final AtomicBoolean bumping = new AtomicBoolean(true);
+        final List<Thread> bystanders = new ArrayList<>();
+        for (int i = 0; i < BYSTANDERS; i++) {
+            final Thread bystander = new Thread(() -> {
+                while (bumping.get()) {
+                    bumpVersionOf(key).join();
+                }
+            }, "bystander-" + i);
+            bystander.setDaemon(true);
+            bystander.start();
+            bystanders.add(bystander);
+        }
+        try {
+            for (int round = 0; round < RACE_ROUNDS; round++) {
+                try {
+                    assertTrue(store.renew(key, handle, TTL).toCompletableFuture()
+                                    .get(OP_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                            "Round " + round + ": the lease was never lost, only written past");
+                } catch (final ExecutionException contended) {
+                    assertInstanceOf(ContendedException.class, contended.getCause(),
+                            "Round " + round + ": a renewal fails only for not knowing");
+                }
+            }
+        } finally {
+            bumping.set(false);
+            for (final Thread bystander : bystanders) {
+                bystander.join(TimeUnit.SECONDS.toMillis(OP_TIMEOUT_SECONDS));
+            }
         }
 
         assertEquals(LockInfoStatus.LOCKED, done(client.getLockInfo(key)).status());
@@ -207,7 +262,7 @@ class DiscasCoordinationStoreTest {
             bump.join();
 
             assertNotEquals(LockInfoStatus.LOCKED, done(client.getLockInfo(key)).status(),
-                    "round " + round + ": the release did not land and the lease is still standing");
+                    "Round " + round + ": the release did not land and the lease is still standing");
         }
     }
 
@@ -228,94 +283,48 @@ class DiscasCoordinationStoreTest {
     }
 
     @Test
-    void refusesALeaseAnotherOwnerHolds() {
+    void refusesALeaseAnotherOwnerOrRunHolds() {
         final String key = leaseKey();
         done(store.tryAcquire(key, "owner-a/run-1", TTL));
 
-        final LeaseAttempt.HeldByOther other =
-                assertInstanceOf(LeaseAttempt.HeldByOther.class, done(store.tryAcquire(key, "owner-b/run-1", TTL)));
+        for (final String other : new String[] {"owner-b/run-1", "owner-a/run-2"}) {
+            final LeaseAttempt.HeldByOther held =
+                    assertInstanceOf(LeaseAttempt.HeldByOther.class, done(store.tryAcquire(key, other, TTL)));
 
-        assertEquals("owner-a/run-1", other.ownerId());
-        // Another holder's deadline is on another machine's wall clock, so the store does not say.
-        assertNull(other.remaining());
+            assertEquals("owner-a/run-1", held.ownerId(), other);
+            // Another holder's deadline is on another machine's wall clock, so the store does not say.
+            assertNull(held.remaining(), other);
+        }
     }
 
     @Test
-    void separatesRunsOfTheSameDeployment() {
-        final String key = leaseKey();
-        done(store.tryAcquire(key, "owner-a/run-1", TTL));
+    void pollsAtTheLongPeriodOnlyForABackgroundWatch() throws Exception {
+        // A client of its own, whose transport counts the answers to reads: every poll is one.
+        final EventLoop loop = new EventLoop("piplex-test-polling");
+        final ClientId id = ClientId.of("piplex-test-polling");
+        final CountingReads reads = new CountingReads(new InProcessClientTransport(loop, NODE_IDS, id));
+        final CoordinationStore polling = new DiscasCoordinationStore(new DisCasClient(id, reads, loop, true),
+                ReadConsistency.LINEARIZABLE, Duration.ofSeconds(20L), true);
+        try {
+            final String key = valueKey();
+            assertTrue(done(polling.compareAndSet(key, CoordinationStore.INITIAL_VERSION, "one")));
+            final Entry before = done(polling.get(key));
+            reads.answered.set(0);
+            final CompletableFuture<Entry> background = polling.awaitChange(
+                    key, before.version(), Duration.ofSeconds(15L), Watch.BACKGROUND).toCompletableFuture();
+            final CompletionStage<Entry> urgent =
+                    polling.awaitChange(key, before.version(), Duration.ofSeconds(15L), Watch.URGENT);
+            // Past both first polls, so the write is what a later poll has to find. A read answered
+            // before the write was sent cannot have seen it.
+            awaitUntil("both watches polled once", () -> reads.answered.get() >= 2);
+            assertTrue(done(polling.compareAndSet(key, before.version(), "two")));
 
-        final LeaseAttempt.HeldByOther other =
-                assertInstanceOf(LeaseAttempt.HeldByOther.class, done(store.tryAcquire(key, "owner-a/run-2", TTL)));
-
-        assertEquals("owner-a/run-1", other.ownerId());
-    }
-
-    @Test
-    void readsAndWritesAKey() {
-        final String key = valueKey();
-
-        final Entry absent = done(store.get(key));
-        assertFalse(absent.exists());
-        assertNull(absent.value());
-
-        assertTrue(done(store.compareAndSet(key, CoordinationStore.INITIAL_VERSION, "one")));
-
-        final Entry written = done(store.get(key));
-        assertTrue(written.exists());
-        assertEquals("one", written.value());
-        assertNotEquals(CoordinationStore.INITIAL_VERSION, written.version());
-
-        assertFalse(done(store.compareAndSet(key, CoordinationStore.INITIAL_VERSION, "two")));
-        assertTrue(done(store.compareAndSet(key, written.version(), "two")));
-        assertEquals("two", done(store.get(key)).value());
-    }
-
-    @Test
-    void answersAtOnceWhenTheVersionHasAlreadyMoved() {
-        final String key = valueKey();
-        assertTrue(done(store.compareAndSet(key, CoordinationStore.INITIAL_VERSION, "one")));
-        final Entry first = done(store.get(key));
-        assertTrue(done(store.compareAndSet(key, first.version(), "two")));
-
-        // The version asked from is already behind, so there is nothing to wait for. This is the case a
-        // waiter hits after a restart, and it is why waiting can be resumed from a version alone.
-        final Entry changed = done(store.awaitChange(key, first.version(), Duration.ofSeconds(10L)));
-        assertTrue(changed.exists());
-        assertEquals("two", changed.value());
-        assertNotEquals(first.version(), changed.version());
-    }
-
-    @Test
-    void comesBackWithWhatIsInForceWhenTheWaitRunsOut() {
-        final String key = valueKey();
-        assertTrue(done(store.compareAndSet(key, CoordinationStore.INITIAL_VERSION, "one")));
-        final Entry written = done(store.get(key));
-
-        // Nothing asserted about the version: a linearizable poll re-accepts the value at a new ballot
-        // and may advance it although nobody wrote. That is exactly why callers here compare state and
-        // never count wakeups, and a test which demanded the version stand still would be demanding a
-        // guarantee piplex deliberately does not rely on.
-        final Entry after = done(store.awaitChange(key, written.version(), Duration.ofSeconds(2L)));
-        assertTrue(after.exists());
-        assertEquals("one", after.value());
-    }
-
-    @Test
-    void noticesAWriteMadeWhileItIsWaiting() {
-        final CoordinationStore polling = new DiscasCoordinationStore(
-                client, ReadConsistency.LINEARIZABLE, DisCasClient.MIN_WATCH_POLL_PERIOD, false);
-        final String key = valueKey();
-        assertTrue(done(polling.compareAndSet(key, CoordinationStore.INITIAL_VERSION, "one")));
-        final Entry before = done(polling.get(key));
-
-        final CompletionStage<Entry> waiting =
-                polling.awaitChange(key, before.version(), Duration.ofSeconds(30L));
-        assertTrue(done(polling.compareAndSet(key, before.version(), "two")));
-
-        final Entry seen = done(waiting);
-        assertTrue(seen.exists());
-        assertEquals("two", seen.value());
+            // The client's own period is a second, spread up to five.
+            assertEquals("two", urgent.toCompletableFuture().get(10L, TimeUnit.SECONDS).value());
+            assertFalse(background.isDone(), "A background watch waits out its own period");
+        } finally {
+            polling.close();
+        }
     }
 
     @Test
@@ -400,10 +409,10 @@ class DiscasCoordinationStoreTest {
         } else if (attempt instanceof LeaseAttempt.HeldBySelf mine) {
             handle = mine.handle();
         } else {
-            throw new AssertionError("round " + round + ": nobody held '" + key
+            throw new AssertionError("Round " + round + ": nobody held '" + key
                     + "' and the acquire still came back " + attempt);
         }
-        assertEquals(owner, handle.ownerId(), "round " + round + ": the lease is in the wrong name");
+        assertEquals(owner, handle.ownerId(), "Round " + round + ": the lease is in the wrong name");
     }
 
     private static String valueKey() {
@@ -414,14 +423,66 @@ class DiscasCoordinationStoreTest {
         return "piplex-test/lease-" + KEYS.incrementAndGet();
     }
 
-    private static <T> T done(final CompletionStage<T> stage) {
-        try {
-            return stage.toCompletableFuture().get(OP_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (final InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while waiting for the store", interrupted);
-        } catch (final ExecutionException | TimeoutException failed) {
-            throw new IllegalStateException("The store did not answer", failed);
+    /**
+     * A transport which counts the answers to reads on their way to the client.
+     */
+    private static final class CountingReads implements ClientTransport {
+
+        private final ClientTransport delegate;
+        private final AtomicInteger answered = new AtomicInteger();
+
+        private CountingReads(final ClientTransport delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void send(final NodeId targetNodeId, final ClientMessage message) {
+            delegate.send(targetNodeId, message);
+        }
+
+        @Override
+        public void register(final Consumer<ClientMessage> handler) {
+            delegate.register(message -> {
+                if (message instanceof ClientMessage.ClientGetResp) {
+                    answered.incrementAndGet();
+                }
+                handler.accept(message);
+            });
+        }
+
+        @Override
+        public void registerConnectionLost(final Consumer<NodeId> handler) {
+            delegate.registerConnectionLost(handler);
+        }
+
+        @Override
+        public List<NodeId> peers() {
+            return delegate.peers();
+        }
+
+        @Override
+        public int clusterSize() {
+            return delegate.clusterSize();
+        }
+
+        @Override
+        public void bindClock(final ClusterClock clock) {
+            delegate.bindClock(clock);
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
+        }
+    }
+
+    private static void awaitUntil(final String what, final BooleanSupplier condition) throws Exception {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(OP_TIMEOUT_SECONDS);
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() - deadline >= 0L) {
+                throw new AssertionError("Gave up waiting until " + what);
+            }
+            Thread.sleep(POLL_INTERVAL_MS);
         }
     }
 

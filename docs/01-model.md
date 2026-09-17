@@ -1,173 +1,115 @@
 ## 1. The model
 
-Everything in piplex is built on three things: one small interface, four keys, and one rule about how
-they are read. Understand these and the rest follows.
+Several controllers make decisions from one shared coordination store. They never call one another,
+and none keeps a private event cursor that must survive a restart.
 
-### The store
+### Store contract
 
-`CoordinationStore` ([source](../piplex-core/src/main/java/io/github/green4j/piplex/store/CoordinationStore.java))
-is six operations plus a `close()`. Any store that has them can run piplex. A store with a pub/sub topic
-and no compare-and-set cannot.
+`CoordinationStore` provides:
 
-| Operation | Answers |
-|---|---|
-| `get(key)` | the value **and the version it was read at** |
-| `compareAndSet(key, expectedVersion, value)` | `true` if it landed, `false` if the version had moved |
-| `awaitChange(key, sinceVersion, maxWait)` | "something moved, look again", bounded by `maxWait` |
-| `tryAcquire(key, ownerId, ttl)` | acquired / held by self / held by somebody else |
-| `renew(key, handle, ttl)` | `true` still yours, `false` not any more |
-| `release(key, handle)` | gives it back |
-| `close()` | ends the store; outstanding waiters are failed, not left hanging |
+- a linearizable read and version-fenced compare-and-set per key;
+- a bounded wait for a key to move past a version;
+- a lease with a strictly increasing fencing token.
 
-Two properties of this interface shape everything above it.
+Operations are asynchronous. A failed operation may have taken effect unless its implementation says
+otherwise. Retrying a compare-and-set is safe because a stale expected version cannot apply twice.
+Every call is bounded by `responseBound`; a wait receives its requested duration in addition to that
+backstop.
 
-**Every read returns a version.** This is what makes a write conditional and a wait answerable. You can
-only ask "has this moved since I looked" if you kept what you looked at.
+`awaitChange` is a query, not an event subscription. It may coalesce several writes and return only
+the latest state. At the end of a partial outage it may return the newest state it saw as
+`confirmed=false`.
 
-**A watch is not a subscription.** `awaitChange` tells you the value left the version you gave it. It
-does not tell you how many times it changed, or through which values. If a value went A to B and back to
-A while nobody was watching, a watcher learns nothing. That is correct behaviour, not a lost event.
+### Compare state, not events
 
-### The rule: compare state, never count events
+Every loop follows the same rule:
 
-Every primitive follows the same loop.
+1. read the current value and version;
+2. decide whether the condition is satisfied;
+3. wait for the version to change, or for a bounded round to end;
+4. read and decide again.
 
-```mermaid
-flowchart LR
-    R["read<br/>value + version"] --> D{"is it what<br/>I need?"}
-    D -- yes --> ACT["act"]
-    D -- no --> W["awaitChange<br/>since that version"]
-    W --> R
-```
+This survives coalesced changes, missed wake-ups and process restarts. It also gives the right answer
+when a value changes away and back: the state in force matters, not an intermediate event.
 
-This is not a style choice. It falls out of the store coalescing changes: a waiter that counted events
-would miss the one it needed.
+### Stored keys
 
-Three things follow, and all three matter:
+Every name used by a run or an operator maps to its own discas key. Different kinds of names map to
+different keys, even when the names are equal. Examples use the quick start names.
 
-- **Restarts are free.** Nobody holds a position in a stream, so there is nothing to lose. A waiter that
-  comes back after a controller restart reads the key and carries on.
-- **Retries are free.** Asking again is the same call as asking.
-- **Intermediate states are never acted on.** If a designation flipped away and back while a watch was
-  in flight, the answer that comes back is the current one: still mine. Reacting to the intermediate
-  state would have been the mistake.
+| Name in piplex | discas key | Example | Read by | Written by |
+|---|---|---|---|---|
+| `key` of `piplexExclusive` / `ExclusiveRequest` | `piplex/exclusive/<key>` | `piplex/exclusive/eod` | The run | The run: acquire, renew, release |
+| `designatedBy` | `piplex/designated/<designatedBy>` | `piplex/designated/eod-owner` | Runs; watched while parked or admitted | Operator: `designate`, `repair` |
+| `enabledBy` | `piplex/enabled/<enabledBy>` | `piplex/enabled/eod-switch` | Runs; watched while parked or admitted | Operator: `disable`, `enable`, `repair` |
+| `enabledBy` plus the controller's `ownerId` | `piplex/enabled/<enabledBy>/@<ownerId>` | `piplex/enabled/eod-switch/@euc1-blue` | Runs of that owner; watched while parked or admitted | Operator: `disable('eod-switch/@euc1-blue', ...)` |
+| `completedWhen` | `piplex/milestone/<completedWhen>` | `piplex/milestone/data/euc1` | Runs; watched while parked | Producer, see the next row |
+| `key` of `piplexPublish` / `publish` | `piplex/milestone/<key>` | `piplex/milestone/data/euc1` | Producer, before its compare-and-set | Producer; operator `repair` |
+| `key` of `piplexAwait` / `awaitAtLeast` | `piplex/milestone/<key>` | `piplex/milestone/data/euc1` | Consumer, watched | Producer, see the previous row |
+| Jenkins `ownerId` | `piplex/instances/<ownerId>` | `piplex/instances/euc1-blue` | The same controller | The controller, every 30 seconds |
 
-### The four keys
+Other properties are not keys:
 
-An operator reads and edits three of these by hand, so the layout is part of the contract.
+- `generation` is compared with the `generation` field inside the milestone record;
+- `ownerId`, `runId` and `executionId` name the lease holder; the lease record keeps that name, the
+  fencing token and the `lease` term;
+- `renewEvery`, `renewalGrace`, `guardGrace`, `handoverWait` and `timeout` are local timings.
 
-```mermaid
-flowchart TD
-    K["piplex/"] --> D["designated/&lt;key&gt;<br/>who may run the work"]
-    K --> E["enabled/&lt;key&gt;<br/>whether it may run at all"]
-    K --> M["milestone/&lt;key&gt;<br/>how far the producer got"]
-    K --> X["exclusive/&lt;key&gt;<br/>the lease -- taken by piplex, never by hand"]
-```
+`piplex/instances/` is not work state, but its prefix must be included in Jenkins ACLs.
 
-| Key | Written by | Value |
-|---|---|---|
-| `piplex/designated/<key>` | an operator, out of band | `{"owner":"euc1-blue","by":"ops","reason":"INC-4821","at":"...","prev":"euc1-green","seq":4}` |
-| `piplex/enabled/<key>` | an operator | `{"enabled":false,"reason":"INC-4821"}` |
-| `piplex/milestone/<key>` | a producer, on success | `{"generation":"2026-09-12","by":"euc1-blue","runId":"eod #142","at":"..."}` |
-| `piplex/exclusive/<key>` | piplex | a lease, taken under `ownerId/runId` |
-
-The first three hold JSON. Two reasons: a coordination key is read by people at three in the morning as
-often as by code, and the store underneath carries bytes and has no opinion about them.
-
-The fourth is different. A lease is a lock in the store's own terms, and over discas that is a binary
-lock record written by `tryAcquire`. It is neither readable nor writable by hand. To find out who holds
-it, ask piplex: the answer comes back on the build that was turned away.
-
-piplex acts on exactly one field of each record: `owner`, `enabled`, `generation`. The rest is
-provenance, so that somebody reading the key can see who put it there and when without opening another
-system. **None of it is an audit trail.** It is written by the same client it describes, and a wrong or
-malicious writer can put anything in it. Audit belongs at the operation, not in the value.
+The designation, switch and milestone records are JSON intended for inspection. The exclusive key is
+a store-native lock record and must never be edited by hand.
 
 ### Generations
 
-A `Generation` is an opaque string, usually a business date, **compared lexicographically**. That is
-enough for the shapes worth using, and it avoids inventing an ordering nobody asked for. It does put one
-burden on the caller:
+A generation identifies a round of work: a business date, batch id or sequence. Piplex compares its
+string lexicographically. ISO-8601 dates therefore order correctly; numeric counters must be
+zero-padded (`09`, `10`).
 
-```
-"2026-09-11" < "2026-09-12"     safe: ISO-8601 orders the way time does
-"10" < "9"                      a bare counter must be zero-padded
-```
-
-`Generation.ofDate(LocalDate)` is safe by construction. A test pins the `"10" < "9"` behaviour on
-purpose, so that nobody "fixes" it into natural ordering and quietly changes what every comparison in
-every pipeline means.
+Milestones move only forward according to this ordering.
 
 ### Identity
 
-There are two identities here, and confusing them is the mistake worth naming.
+`ownerId` identifies a deployment or Jenkins controller. It is stable operational identity, not a
+hostname or URL that may change.
 
-**`ownerId` is the deployment.** `euc1-blue`. Not a worker, not a build. It is what a designation names,
-what every log line carries, and what a second controller must not also call itself.
+A lease identifies one execution as:
 
-It is not derived from anything. A Jenkins URL can change; a hostname is a detail of where the thing
-happens to run. Either one changing silently would hand the work to the wrong region. So it is typed in
-by hand, once, per controller.
-
-**A lease is held by a run, not by a deployment.** The lease owner is `ownerId + "/" + runId`:
-
-```mermaid
-flowchart LR
-    A["euc1-blue / eod 142"] -- "holds" --> L[("piplex/exclusive/eod")]
-    B["euc1-blue / eod 143"] -. "HeldByOther" .-> L
-    C["euc1-green / eod 77"] -. "HeldByOther" .-> L
+```text
+ownerId/runId[/executionId]
 ```
 
-A store may answer "you already hold this" when the owner matches. That answer is only safe if the owner
-names one holder. With the deployment alone, two concurrent runs on the same controller would both be
-let in, which is exactly what the lease exists to prevent. With the run included, a second run sees a
-lease held by somebody else, while a retry of the same run after an unknown outcome still recognises its
-own.
+Each part is escaped before joining. `runId` separates builds on one owner; `executionId` separates
+concurrent exclusive asks made by one run. A retry must use the same values so that an acquisition
+whose result was lost is recovered as `HeldBySelf`.
 
 ### Time
 
-`TimeSource` is one argument, not two. Inside it, the two readings are kept apart.
+Elapsed time uses a monotonic clock. Wall time is used only for human-readable timestamps in records.
+This prevents NTP corrections or clock changes from moving lease and wait deadlines.
 
-| Reading | Used for |
-|---|---|
-| monotonic (`nanos`) | every duration: leases, renewals, deadlines, how long a parked run waits |
-| wall clock (`wallTime`) | one thing only -- the timestamp written into a record for a person to read |
+Lease information crosses process boundaries as a remaining duration, never as another machine's
+clock reading.
 
-A wall clock is allowed to step. A lease timed against one can lapse early, and an early lapse means two
-owners at once. So nothing piplex decides is allowed to notice an NTP correction. The test harness has a
-`jump()` that moves the wall clock alone, precisely to prove that.
+### Guarantees
 
-### What piplex guarantees, and what it does not
+Piplex guarantees:
 
-It guarantees that **at most one controller considers itself the owner**.
+- at most one live lease on a key in the coordination store;
+- a fencing token strictly higher than every earlier acquisition of that key;
+- local ownership ends no later than the lease term known to the holder;
+- designation and switch changes revoke a holder once its watch observes the new state;
+- milestones are monotonic and waits compare state.
 
-It does not guarantee that at most one controller can still *affect* a protected resource. Between a
-lease expiring and its former holder noticing, both may believe they hold it:
+Piplex does **not** guarantee that only one process believes it owns the work at every instant. A lease
+may expire before its former holder observes the loss. It also cannot undo partial work or stop a
+process Jenkins cannot reach.
 
-```mermaid
-sequenceDiagram
-    participant B as euc1-blue
-    participant S as store
-    participant G as euc1-green
-    B->>S: renew (lost in the network)
-    Note over B: still believes it holds it
-    Note over S: lease lapses
-    G->>S: tryAcquire
-    S-->>G: Acquired, fencingToken 8
-    Note over B,G: both believe they own it
-    B->>S: renew
-    S-->>B: false
-    Note over B: revoked -- LEASE_LOST
-```
+The fencing token closes the stale-holder window only when the protected resource remembers the
+highest token it has accepted and rejects lower ones. Without such fencing, make the work idempotent
+and check `isHeld()` before irreversible steps.
 
-The `fencingToken` carried by an admitted run is what closes that window. It only closes it if the
-**protected resource itself** rejects a stale token, and most resources do not. Where it cannot, the
-overlap is real. Stopping a run half way is not the same as making half-finished work harmless, and that
-part is a property of your work, not of piplex.
+Publishing a completion milestone is not transactionally tied to the lease. Publish while admission
+is still held; `Admitted.completeAndRelease()` does this in the correct order.
 
-Milestones compose well with this. A milestone is published only on success, so an interrupted producer
-publishes nothing and consumers keep waiting rather than proceeding on a partial result.
-
----
-
-Previous: [0. Quick start](00-quick-start.md) &middot; Next: [2. Exclusive run](02-exclusive-run.md)
+Previous: [Quick start](00-quick-start.md) · Next: [2. Exclusive runs](02-exclusive-run.md) · [Documentation index](README.md)

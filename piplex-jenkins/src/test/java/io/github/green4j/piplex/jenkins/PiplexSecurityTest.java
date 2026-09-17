@@ -9,7 +9,6 @@ package io.github.green4j.piplex.jenkins;
 
 import hudson.AbortException;
 import hudson.util.Secret;
-import io.github.green4j.discas.common.transport.security.ClientSecurityProvider;
 import io.github.green4j.discas.common.transport.security.PlaintextClientSecurity;
 import io.github.green4j.discas.common.transport.tls.TlsClientSecurityProvider;
 import org.junit.jupiter.api.Test;
@@ -20,15 +19,15 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * How the three security settings turn into the thing every connection is wrapped in.
@@ -40,100 +39,92 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 @WithJenkins
 class PiplexSecurityTest {
 
+    // With TLS on, a node's certificate is checked against the nodes this controller was configured
+    // with, so the settings that turn TLS on need those as well.
+    private static final String CLUSTER = "n1=10.0.0.1:7101\nn2=10.0.0.2:7101";
+
     @TempDir
     private Path directory;
 
     @Test
-    void connectsInClearWhenNothingAsksOtherwise(final JenkinsRule jenkins) throws Exception {
-        final PiplexConfiguration configuration = PiplexConfiguration.get();
-
-        // The cluster in the quick start: a private network, discas in allowall.
-        assertSame(PlaintextClientSecurity.PROVIDER, configuration.security());
-    }
-
-    @Test
-    void refusesToConnectInClearWithStoresFilledIn(final JenkinsRule jenkins) {
-        final PiplexConfiguration configuration = PiplexConfiguration.get();
-        configuration.setTls(false);
-        configuration.setTlsTruststore(directory.resolve("client-ca.p12").toString());
-
-        // Somebody who filled a trust store in believes this connection is encrypted. Quietly using
-        // the store as decoration, or quietly ignoring the unticked box, both end with a token going
-        // out in clear and nothing saying so.
-        final AbortException refused = assertThrows(AbortException.class, configuration::security);
-
-        assertTrue(refused.getMessage().contains("TLS is off"), refused.getMessage());
-        assertTrue(refused.getMessage().contains("Manage Jenkins"), refused.getMessage());
-    }
-
-    @Test
-    void authenticatesTheNodeOnlyWhenNoKeyStoreIsConfigured(final JenkinsRule jenkins) throws Exception {
-        final PiplexConfiguration configuration = PiplexConfiguration.get();
-        configuration.setTls(true);
-
-        // TLS against the JVM's own trust store, presenting nothing. What a token cluster needs, and
-        // what an mtls one will turn away at the handshake.
-        final ClientSecurityProvider security = configuration.security();
-
-        assertInstanceOf(TlsClientSecurityProvider.class, security);
-        assertNotSame(PlaintextClientSecurity.PROVIDER, security);
-    }
-
-    @Test
-    void presentsThisControllersCertificateWhenAKeyStoreIsConfigured(final JenkinsRule jenkins)
-            throws Exception {
-        final Path keystore = keyStoreHolding("euc1-blue", "changeit");
-        final PiplexConfiguration configuration = PiplexConfiguration.get();
-        configuration.setTls(true);
-        configuration.setTlsKeystore(keystore.toString());
-        configuration.setTlsKeystorePassword(Secret.fromString("changeit"));
-
-        assertInstanceOf(TlsClientSecurityProvider.class, configuration.security());
-    }
-
-    @Test
-    void namesTheFileWhenAStoreIsNotThere(final JenkinsRule jenkins) {
+    void refusesSettingsItCannotConnectWithSafely(final JenkinsRule jenkins) throws Exception {
+        final Path keystore = KeyStores.keyStoreHolding(directory, "euc1-blue", "changeit");
         final Path missing = directory.resolve("nobody-put-this-here.p12");
-        final PiplexConfiguration configuration = PiplexConfiguration.get();
-        configuration.setTls(true);
-        configuration.setTlsTruststore(missing.toString());
-
-        final AbortException refused = assertThrows(AbortException.class, configuration::security);
-
-        // The two commonest failures are a file the controller cannot read and a password that does
-        // not open it. One of them is answered by looking at the file, so say which file.
-        assertTrue(refused.getMessage().contains(missing.toString()), refused.getMessage());
-        assertTrue(refused.getMessage().contains("trust store"), refused.getMessage());
-    }
-
-    @Test
-    void namesTheFileWhenItIsNotAKeyStoreAtAll(final JenkinsRule jenkins) throws Exception {
         final Path notAStore = directory.resolve("README.txt");
         Files.writeString(notAStore, "the certificate is in the other directory", StandardCharsets.UTF_8);
-        final PiplexConfiguration configuration = PiplexConfiguration.get();
-        configuration.setTls(true);
-        configuration.setTlsKeystore(notAStore.toString());
-        configuration.setTlsKeystorePassword(Secret.fromString("changeit"));
 
-        final AbortException refused = assertThrows(AbortException.class, configuration::security);
+        final List<Refused> table = List.of(
+                // Somebody who filled a trust store in believes this connection is encrypted.
+                new Refused(c -> c.setTlsTruststore(missing.toString()), "TLS is off", "Manage Jenkins"),
+                // The token is this controller's password to the whole cluster, and no setting sends it in
+                // clear.
+                new Refused(c -> c.setToken(Secret.fromString("s3cret")), "in clear", "Connect over TLS"),
+                // A node admits clients one way at a time, and which one is meant cannot be told from here.
+                new Refused(c -> {
+                    c.setTls(true);
+                    keyStore(c, keystore, "changeit");
+                    c.setToken(Secret.fromString("s3cret"));
+                }, "--client-auth token", "--client-auth mtls"),
+                // Nothing pinned and no identity check: any CA in the JVM's store vouches for whoever
+                // answers, and the first thing this controller does is hand them the token.
+                new Refused(c -> {
+                    c.setTls(true);
+                    c.setTlsVerifyNodeIdentity(false);
+                }, "any CA this JVM trusts", "trust store"),
+                // The commonest failures: a file the controller cannot read, and a password that does not
+                // open it. Both are answered by looking at the file, so the file is named.
+                new Refused(c -> {
+                    c.setTls(true);
+                    c.setTlsTruststore(missing.toString());
+                }, missing.toString(), "trust store"),
+                new Refused(c -> {
+                    c.setTls(true);
+                    keyStore(c, notAStore, "changeit");
+                }, notAStore.toString(), "key store"),
+                new Refused(c -> {
+                    c.setTls(true);
+                    keyStore(c, keystore, "not-the-password");
+                }, keystore.toString()));
 
-        assertTrue(refused.getMessage().contains(notAStore.toString()), refused.getMessage());
-        assertTrue(refused.getMessage().contains("key store"), refused.getMessage());
+        for (final Refused row : table) {
+            final PiplexConfiguration configuration = cleared();
+            row.settings().accept(configuration);
+
+            final AbortException refused = assertThrows(AbortException.class, configuration::security);
+
+            for (final String said : row.said()) {
+                assertTrue(refused.getMessage().contains(said), refused.getMessage());
+            }
+        }
     }
 
     @Test
-    void refusesAKeyStoreItsPasswordDoesNotOpen(final JenkinsRule jenkins) throws Exception {
-        final Path keystore = keyStoreHolding("euc1-blue", "changeit");
-        final PiplexConfiguration configuration = PiplexConfiguration.get();
-        configuration.setTls(true);
-        configuration.setTlsKeystore(keystore.toString());
-        configuration.setTlsKeystorePassword(Secret.fromString("not-the-password"));
+    void wrapsEveryConnectionTheWayTheSettingsSay(final JenkinsRule jenkins) throws Exception {
+        final Path keystore = KeyStores.keyStoreHolding(directory, "euc1-blue", "changeit");
+        final Path truststore = KeyStores.trustStoreHolding(directory, "n1", "changeit");
 
-        final AbortException refused = assertThrows(AbortException.class, configuration::security);
+        // The cluster in the quick start: a private network, discas in allowall.
+        assertSame(PlaintextClientSecurity.PROVIDER, cleared().security());
 
-        // A stack trace ending in UnrecoverableKeyException is not what somebody reading a failed
-        // build needs to be told.
-        assertTrue(refused.getMessage().contains(keystore.toString()), refused.getMessage());
+        // TLS against the JVM's own trust store, presenting nothing: what a token cluster needs.
+        final PiplexConfiguration tls = cleared();
+        tls.setTls(true);
+        assertInstanceOf(TlsClientSecurityProvider.class, tls.security());
+
+        // Presenting this controller's certificate, which is what an mtls cluster needs.
+        final PiplexConfiguration mtls = cleared();
+        mtls.setTls(true);
+        keyStore(mtls, keystore, "changeit");
+        assertInstanceOf(TlsClientSecurityProvider.class, mtls.security());
+
+        // A trust store holding the nodes' own certificates is a coarser test of identity of its own, so
+        // a cluster whose certificates name nothing this controller can match is not stuck.
+        final PiplexConfiguration pinned = cleared();
+        pinned.setTls(true);
+        pinned.setTlsTruststore(truststore.toString());
+        pinned.setTlsTruststorePassword(Secret.fromString("changeit"));
+        pinned.setTlsVerifyNodeIdentity(false);
+        assertInstanceOf(TlsClientSecurityProvider.class, pinned.security());
     }
 
     @Test
@@ -154,11 +145,11 @@ class PiplexSecurityTest {
 
     @Test
     void picksUpAStoreRewrittenUnderIt(final JenkinsRule jenkins) throws Exception {
-        final Path keystore = keyStoreHolding("euc1-blue", "changeit");
+        final Path keystore = KeyStores.keyStoreHolding(directory, "euc1-blue", "changeit");
         final PiplexConfiguration configuration = PiplexConfiguration.get();
         configuration.setTls(true);
-        configuration.setTlsKeystore(keystore.toString());
-        configuration.setTlsKeystorePassword(Secret.fromString("changeit"));
+        configuration.setNodes(CLUSTER);
+        keyStore(configuration, keystore, "changeit");
         assertInstanceOf(TlsClientSecurityProvider.class, configuration.security());
 
         // A rotated certificate is a file replaced on disk. Nothing here holds the old one open, so
@@ -169,38 +160,32 @@ class PiplexSecurityTest {
     }
 
     /**
-     * A PKCS12 file with one certificate and key in it, made by keytool.
-     *
-     * <p>By keytool rather than assembled here, because that is what an operator will point these
-     * settings at. A file this test built to its own taste would prove that the plugin reads files
-     * this test writes.
-     *
-     * @param alias    the certificate's alias, also its CN
-     * @param password the store's password, and the key's
-     * @return the file written
-     * @throws Exception if keytool cannot be run
+     * @return the settings as nothing had been set, but for the cluster
      */
-    private Path keyStoreHolding(final String alias, final String password) throws Exception {
-        final Path keytool = Path.of(System.getProperty("java.home"), "bin", "keytool");
-        assumeTrue(Files.isExecutable(keytool), "no keytool in this JDK");
+    private static PiplexConfiguration cleared() {
+        final PiplexConfiguration configuration = PiplexConfiguration.get();
+        configuration.setNodes(CLUSTER);
+        configuration.setTls(false);
+        configuration.setToken(null);
+        configuration.setTlsKeystore(null);
+        configuration.setTlsKeystorePassword(null);
+        configuration.setTlsTruststore(null);
+        configuration.setTlsTruststorePassword(null);
+        configuration.setTlsVerifyNodeIdentity(true);
+        return configuration;
+    }
 
-        final Path file = directory.resolve(alias + ".p12");
-        final Process keytoolRun = new ProcessBuilder(
-                keytool.toString(),
-                "-genkeypair",
-                "-alias", alias,
-                "-keyalg", "RSA",
-                "-keysize", "2048",
-                "-validity", "1",
-                "-dname", "CN=" + alias,
-                "-storetype", "PKCS12",
-                "-keystore", file.toString(),
-                "-storepass", password,
-                "-keypass", password)
-                .redirectErrorStream(true)
-                .start();
-        final String said = new String(keytoolRun.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertEquals(0, keytoolRun.waitFor(), said);
-        return file;
+    private static void keyStore(final PiplexConfiguration configuration, final Path file, final String password) {
+        configuration.setTlsKeystore(file.toString());
+        configuration.setTlsKeystorePassword(Secret.fromString(password));
+    }
+
+    /**
+     * Settings a controller must not connect with, and what the refusal has to say.
+     *
+     * @param settings what an operator filled in
+     * @param said     what the message names
+     */
+    private record Refused(Consumer<PiplexConfiguration> settings, String... said) {
     }
 }

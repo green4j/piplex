@@ -30,7 +30,7 @@ public final class ContendedException extends RuntimeException {
      * @param attempts how many times it was tried
      */
     public ContendedException(final String key, final int attempts) {
-        super("key '" + key + "' lost the compare " + attempts + " times running");
+        super("Key '" + key + "' lost the compare " + attempts + " times running");
         this.key = key;
     }
 

@@ -7,11 +7,11 @@
 
 package io.github.green4j.piplex.jenkins;
 
-import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import io.github.green4j.piplex.Generation;
+import io.github.green4j.piplex.milestone.PublishResult;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.workflow.steps.Step;
 import org.jenkinsci.plugins.workflow.steps.StepContext;
@@ -22,16 +22,11 @@ import org.kohsuke.stapler.DataBoundConstructor;
 import java.util.Set;
 
 /**
- * {@code piplexPublish} -- say how far the work got, so that pipelines elsewhere can start.
+ * {@code piplexPublish} -- publishes a completed milestone generation.
  *
- * <pre>
- * post { success { piplexPublish key: 'data/euc1', generation: env.BUSINESS_DATE } }
- * </pre>
- *
- * <p>In {@code post { success { } }} and nowhere else. A milestone is a promise that the data is there,
- * and a producer that publishes on the way out regardless of outcome turns every waiting pipeline into a
- * consumer of half-written days. Publishing only on success is what makes an interrupted producer safe:
- * it publishes nothing, and the waiters keep waiting.
+ * <p>Call it only after successful work. Publication is monotonic and idempotent, and the step returns
+ * the generation in force. When an exclusive request uses {@code completedWhen}, publish while its
+ * body still holds the lease.
  */
 public final class PiplexPublishStep extends Step {
 
@@ -74,7 +69,6 @@ public final class PiplexPublishStep extends Step {
         }
 
         @Override
-        @NonNull
         public String getDisplayName() {
             return "Publish a piplex milestone";
         }
@@ -92,6 +86,12 @@ public final class PiplexPublishStep extends Step {
         private final String key;
         private final String generation;
 
+        // Not carried across a restart: onResume publishes again, and that write is nobody's to stop yet.
+        private transient boolean answered;
+        // A write sent and not yet settled, and the stop that arrived meanwhile. Guarded by this.
+        private transient boolean writing;
+        private transient Throwable stoppedWith;
+
         Execution(final StepContext context, final String key, final String generation) {
             super(context);
             this.key = key;
@@ -104,6 +104,46 @@ public final class PiplexPublishStep extends Step {
             return false;
         }
 
+        /**
+         * Ends the step, unless the answer it was waiting for got there first.
+         *
+         * @param cause why the build is stopping
+         */
+        @Override
+        public void stop(final Throwable cause) throws Exception {
+            synchronized (this) {
+                if (writing && !answered) {
+                    // Answered once the write settles. Answered now, the body ends and its lease goes
+                    // back while the milestone is still on its way, and the next owner redoes the work.
+                    stoppedWith = cause;
+                    return;
+                }
+            }
+            if (answering()) {
+                super.stop(cause);
+            }
+        }
+
+        /**
+         * Claims the right to answer the context, once.
+         *
+         * <p>A watch in discas is a poll bounded by the wait it was given, and there is nothing here
+         * that can call one off early -- so the answer still coming and the build being stopped are two
+         * outcomes racing for one step. A flag read and then acted on leaves the gap between the two
+         * open, which is an aborted build getting a second outcome minutes after somebody pressed the
+         * button. Whichever asks first here wins, and the other one does nothing.
+         *
+         * @return whether this caller is the one that gets to answer
+         */
+        private synchronized boolean answering() {
+            if (answered) {
+                return false;
+            }
+            answered = true;
+            return true;
+        }
+
+
         @Override
         public void onResume() {
             // Publishing is idempotent and monotonic, so the answer to "did the write land before the
@@ -111,24 +151,52 @@ public final class PiplexPublishStep extends Step {
             try {
                 publish();
             } catch (final Exception failed) {
-                getContext().onFailure(failed);
+                if (answering()) {
+                    getContext().onFailure(failed);
+                }
             }
         }
 
         private void publish() throws Exception {
-            final PiplexConfiguration configuration = PiplexConfiguration.get();
             final TaskListener listener = getContext().get(TaskListener.class);
             final Run<?, ?> run = getContext().get(Run.class);
-            configuration.piplexFor(listener).milestones()
-                    .publish(key, Generation.of(generation), configuration.requireOwnerId(),
-                            run.getFullDisplayName())
-                    .whenComplete((result, error) -> {
-                        if (error != null) {
-                            getContext().onFailure(error);
-                        } else {
-                            getContext().onSuccess(result.inForce().generation().value());
-                        }
-                    });
+            final PiplexConfiguration.Configured configured =
+                    PiplexConfiguration.require().configuredFor(listener);
+            synchronized (this) {
+                writing = true;
+            }
+            try {
+                configured.piplex().milestones()
+                        // The externalizable id, "eod#142", which is what the exclusive step writes and
+                        // what an aggregator groups a night's events by. A display name is a pipeline's to
+                        // set, so two runs can carry the same one and the grouping quietly merges them.
+                        .publish(key, Generation.of(generation), configured.ownerId(),
+                                run.getExternalizableId())
+                        .whenComplete(this::written);
+            } catch (final RuntimeException notSent) {
+                synchronized (this) {
+                    writing = false;
+                }
+                throw notSent;
+            }
+        }
+
+        private void written(final PublishResult result, final Throwable error) {
+            final Throwable stopped;
+            synchronized (this) {
+                writing = false;
+                stopped = stoppedWith;
+            }
+            if (!answering()) {
+                return;
+            }
+            if (stopped != null) {
+                getContext().onFailure(stopped);
+            } else if (error != null) {
+                getContext().onFailure(error);
+            } else {
+                getContext().onSuccess(result.inForce().generation().value());
+            }
         }
     }
 }

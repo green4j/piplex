@@ -10,11 +10,15 @@ package io.github.green4j.piplex.observe;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.exclusive.Revocation;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 /**
  * The line is a contract for whatever aggregates it, so the shape of it is worth a test.
@@ -57,21 +61,22 @@ class TextPiplexObserverTest {
                 + "reason=LEASE_LOST", lines.get(0));
     }
 
-    @Test
-    void keepsAValueWithSpacesInItOneValue() {
-        // What an operator types when switching work off, and the commonest way a key=value line stops
-        // parsing: unquoted, everything after the first space reads as a field of its own.
-        observer.disabled(RUN, "INC-4471 migrating the cluster");
-
-        assertEquals("DISABLED key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
-                + "reason=\"INC-4471 migrating the cluster\"", lines.get(0));
+    static List<Arguments> reasons() {
+        return List.of(
+                arguments("INC-4471 migrating the cluster", "\"INC-4471 migrating the cluster\""),
+                arguments("she said \"later\"", "\"she said \\\"later\\\"\""),
+                arguments("INC-4471\nsee the runbook\r\n", "\"INC-4471\\nsee the runbook\\r\\n\""),
+                arguments("INC-4471\tmigrating", "\"INC-4471\\tmigrating\""));
     }
 
-    @Test
-    void escapesAQuoteRatherThanEndingTheValueWithIt() {
-        observer.disabled(RUN, "she said \"later\"");
+    // A reason is typed by an operator, and an aggregator splits on whitespace: unquoted, a space or a
+    // tab ends the field, and a line break starts an event of its own. One event, one line.
+    @ParameterizedTest
+    @MethodSource("reasons")
+    void keepsAReasonOneValueOnOneLine(final String typed, final String written) {
+        observer.disabled(RUN, typed);
 
-        assertEquals("DISABLED key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
-                + "reason=\"she said \\\"later\\\"\"", lines.get(0));
+        assertEquals(List.of("DISABLED key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 reason="
+                + written), lines);
     }
 }

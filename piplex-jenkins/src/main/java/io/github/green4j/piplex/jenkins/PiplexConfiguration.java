@@ -7,10 +7,15 @@
 
 package io.github.green4j.piplex.jenkins;
 
-import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.AbortException;
+import hudson.BulkChange;
 import hudson.Extension;
+import hudson.init.InitMilestone;
+import hudson.model.Descriptor.FormException;
+import hudson.init.Initializer;
+import hudson.init.Terminator;
 import hudson.model.TaskListener;
+import hudson.model.listeners.SaveableListener;
 import hudson.util.Secret;
 import io.github.green4j.discas.client.DisCasClient;
 import io.github.green4j.discas.client.DisCasClientConfig;
@@ -33,11 +38,16 @@ import io.github.green4j.piplex.discas.DiscasCoordinationStore;
 import io.github.green4j.piplex.observe.TextPiplexObserver;
 import io.github.green4j.piplex.store.CoordinationStore;
 import jenkins.model.GlobalConfiguration;
+import jenkins.model.Jenkins;
+import net.sf.json.JSONObject;
 import org.jenkinsci.Symbol;
+import org.jenkinsci.plugins.workflow.flow.FlowExecutionList;
 import org.kohsuke.stapler.DataBoundSetter;
+import org.kohsuke.stapler.StaplerRequest2;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
@@ -46,70 +56,30 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
-import java.util.concurrent.Executors;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
 
 /**
- * Where the one store this controller talks to is built, and the only place in the plugin that names an
- * implementation.
+ * The Jenkins composition root for controller identity, discas connectivity and piplex primitives.
  *
- * <p>This is the composition root, and it is a plain {@code new}. Nothing is discovered: swapping the
- * store means editing {@link #build()}, which is a diff somebody can read, rather than a file on a
- * classpath that changes behaviour without appearing in any review.
+ * <p>{@code ownerId} is the stable controller identity. The authenticated connection is either a
+ * token over TLS with no client key store, or mTLS with a client key store and no token. Node identity
+ * verification is enabled by default and checks membership in the configured cluster.
  *
- * <p>{@code ownerId} is the setting that matters most. It is this controller's identity -- what a
- * designation names, what appears in every log line, and what a second controller must not also call
- * itself. It is not derivable: a Jenkins URL can change, a hostname is an implementation detail of
- * where it happens to run, and either one silently changing would hand the work to the wrong region.
- * So it is typed in, once, per controller.
- *
- * <p>The rest say how to reach the cluster, and how much of what it is told it should believe. A
- * discas node admits clients in one of three modes, and the settings here line up with them one for
- * one:
- *
- * <table>
- *   <caption>What to fill in for each of discas' client-auth modes</caption>
- *   <tr><th>{@code --client-auth}</th><th>Fill in</th><th>The client id is</th></tr>
- *   <tr><td>{@code allowall}</td><td>nothing</td><td>claimed, and nothing checks it</td></tr>
- *   <tr><td>{@code token}</td><td>{@code token}, and {@code tls} for it not to cross the wire in
- *       clear</td><td>still claimed; the token says the caller is one of us, not which one</td></tr>
- *   <tr><td>{@code mtls}</td><td>{@code tls}, {@code tlsKeystore}, {@code tlsTruststore}</td>
- *       <td>the certificate's subject, and nothing else</td></tr>
- * </table>
- *
- * <p>{@code watchPollPeriod} is the one setting here that is about cost rather than about identity. A
- * discas watch is a poll, and the client's own default of one second is right for work whose answer
- * changes by the minute. A nightly job parked for four hours waiting to be designated spends that
- * second over and over on a question whose answer changes once a quarter, so raising it is how the
- * standing cost of parking is made to match how often anything actually moves.
- *
- * <p>How watches <i>read</i> is not a setting, and that is a different decision from how often. Every
- * watch here is {@link ReadConsistency#LINEARIZABLE}, because the two an admitted run holds act on the
- * value the watch itself returned rather than reading again: a stale designation revokes the run late,
- * and late is precisely the window in which two controllers both believe they own the work. Polling
- * less often lengthens the same window, but by an amount that is written down in a field rather than
- * by however far behind the node that answered happens to be.
- *
- * <p>TLS is a checkbox rather than something inferred from a key store being filled in, and that is
- * deliberate. Inferring it means a path typed into the wrong field, or cleared while somebody was
- * looking at something else, silently downgrades every controller to plaintext and nothing says so.
- * Asked for explicitly, the same mistake is a build that will not start, which is the failure worth
- * having.
- *
- * <p>The store is built on first use and kept until a setting changes. Changing one <b>closes</b> it,
- * the discas client and the scheduler with it, and the next step builds a new one from the new
- * settings.
- *
- * <p>That has a cost worth stating plainly, because it is not the obvious behaviour: a run in flight is
- * holding that store, so its renewals stop and it is revoked once its grace period is out, exactly as
- * if the cluster had gone away. It is still the right way round. The alternative is a live connection
- * under an identity the operator has just changed, left open because something might still be using it
- * -- one more of them after every edit, none of them ever closed. Settings here are changed a handful
- * of times in the life of a controller, and the run that stops is one that would otherwise carry on
- * under a configuration that no longer exists.
+ * <p>Builds see one saved settings snapshot. Saving closes the previous store, so runs using it are
+ * eventually revoked; the scheduler remains alive until Jenkins stops so those failures are observed.
+ * Background watch cost is controlled by {@code watchPollPeriod}; admitted-run watches always use
+ * linearizable reads at the client period.
  */
 @Extension
 @Symbol("piplex")
@@ -125,6 +95,9 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     private Secret tlsKeystorePassword;
     private String tlsTruststore;
     private Secret tlsTruststorePassword;
+    // Initialised on, and read back from disk only where it was written: a controller configured before
+    // this existed has no entry for it, and what it gets is the check rather than the absence of one.
+    private boolean tlsVerifyNodeIdentity = true;
     private String watchPollPeriod;
 
     private static volatile CoordinationStore supplied;
@@ -133,9 +106,17 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     private transient ScheduledExecutorService scheduler;
     private transient TimeSource time;
     private transient CoordinationStore store;
+    private transient volatile boolean binding;
+    // What builds read: the settings as last saved, published whole by save().
+    private transient volatile Settings applied;
+    // Guarded by this: the mark this process writes under its owner id, and the timer that writes it.
+    private transient OwnerHeartbeat heartbeat;
+    private transient TimeSource.Cancellable beat;
+    private transient boolean stopped;
 
     public PiplexConfiguration() {
         load();
+        applied = snapshot();
     }
 
     /**
@@ -146,9 +127,22 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     }
 
     /**
-     * @return this controller's identity, as a designation would name it
+     * @return the singleton Jenkins keeps
+     * @throws AbortException if Jenkins has none to give
      */
-    public String getOwnerId() {
+    static PiplexConfiguration require() throws AbortException {
+        final PiplexConfiguration configuration = get();
+        if (configuration == null) {
+            throw new AbortException("piplex: the plugin's configuration is not available in this "
+                    + "Jenkins, so the controller's owner id and store cannot be read");
+        }
+        return configuration;
+    }
+
+    /**
+     * @return this controller's identity as last entered, which a build uses only once it is saved
+     */
+    public synchronized String getOwnerId() {
         return ownerId;
     }
 
@@ -156,7 +150,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * @param value this controller's identity
      */
     @DataBoundSetter
-    public void setOwnerId(final String value) {
+    public synchronized void setOwnerId(final String value) {
         this.ownerId = trimmed(value);
         changed();
     }
@@ -164,7 +158,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     /**
      * @return the identity this controller connects to discas under
      */
-    public String getClientId() {
+    public synchronized String getClientId() {
         return clientId;
     }
 
@@ -172,7 +166,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * @param value the identity to connect under; blank means the same as {@code ownerId}
      */
     @DataBoundSetter
-    public void setClientId(final String value) {
+    public synchronized void setClientId(final String value) {
         this.clientId = trimmed(value);
         changed();
     }
@@ -180,7 +174,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     /**
      * @return the cluster, as {@code nodeId=host:port} entries separated by commas or newlines
      */
-    public String getNodes() {
+    public synchronized String getNodes() {
         return nodes;
     }
 
@@ -188,7 +182,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * @param value the cluster
      */
     @DataBoundSetter
-    public void setNodes(final String value) {
+    public synchronized void setNodes(final String value) {
         this.nodes = trimmed(value);
         changed();
     }
@@ -196,7 +190,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     /**
      * @return the shared token this controller authenticates with, or {@code null} for none
      */
-    public Secret getToken() {
+    public synchronized Secret getToken() {
         return token;
     }
 
@@ -204,7 +198,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * @param value the token a cluster running {@code --client-auth token} expects; blank means none
      */
     @DataBoundSetter
-    public void setToken(final Secret value) {
+    public synchronized void setToken(final Secret value) {
         this.token = secret(value);
         changed();
     }
@@ -212,7 +206,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     /**
      * @return whether the connection to the cluster is TLS
      */
-    public boolean isTls() {
+    public synchronized boolean isTls() {
         return tls;
     }
 
@@ -221,7 +215,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      *              {@code --client-tls} or {@code --client-auth mtls}
      */
     @DataBoundSetter
-    public void setTls(final boolean value) {
+    public synchronized void setTls(final boolean value) {
         this.tls = value;
         changed();
     }
@@ -229,7 +223,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     /**
      * @return the PKCS12 file holding this controller's client certificate, or {@code null} for none
      */
-    public String getTlsKeystore() {
+    public synchronized String getTlsKeystore() {
         return tlsKeystore;
     }
 
@@ -239,7 +233,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      *              presents no certificate and only the node is authenticated
      */
     @DataBoundSetter
-    public void setTlsKeystore(final String value) {
+    public synchronized void setTlsKeystore(final String value) {
         this.tlsKeystore = trimmed(value);
         changed();
     }
@@ -247,7 +241,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     /**
      * @return the password of {@link #getTlsKeystore()}, or {@code null} if it needs none
      */
-    public Secret getTlsKeystorePassword() {
+    public synchronized Secret getTlsKeystorePassword() {
         return tlsKeystorePassword;
     }
 
@@ -255,7 +249,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * @param value the key store's password, which is also taken as the private key's
      */
     @DataBoundSetter
-    public void setTlsKeystorePassword(final Secret value) {
+    public synchronized void setTlsKeystorePassword(final Secret value) {
         this.tlsKeystorePassword = secret(value);
         changed();
     }
@@ -263,7 +257,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     /**
      * @return the PKCS12 file of CAs the nodes are checked against, or {@code null} for the JVM's own
      */
-    public String getTlsTruststore() {
+    public synchronized String getTlsTruststore() {
         return tlsTruststore;
     }
 
@@ -273,7 +267,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      *              public CA signed them
      */
     @DataBoundSetter
-    public void setTlsTruststore(final String value) {
+    public synchronized void setTlsTruststore(final String value) {
         this.tlsTruststore = trimmed(value);
         changed();
     }
@@ -281,7 +275,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     /**
      * @return the password of {@link #getTlsTruststore()}, or {@code null} if it needs none
      */
-    public Secret getTlsTruststorePassword() {
+    public synchronized Secret getTlsTruststorePassword() {
         return tlsTruststorePassword;
     }
 
@@ -289,31 +283,207 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * @param value the trust store's password; most hold public certificates and have none
      */
     @DataBoundSetter
-    public void setTlsTruststorePassword(final Secret value) {
+    public synchronized void setTlsTruststorePassword(final Secret value) {
         this.tlsTruststorePassword = secret(value);
         changed();
     }
 
     /**
-     * @return the shortest gap between polls of a watch, or {@code null} for the client's own
+     * @return whether a node's certificate has to name a node this controller was configured with
      */
-    public String getWatchPollPeriod() {
+    public synchronized boolean isTlsVerifyNodeIdentity() {
+        return tlsVerifyNodeIdentity;
+    }
+
+    /**
+     * @param value whether to require the certificate a node presents to name one of the configured
+     *              nodes, by node id or by host. Turning it off leaves the certificate chain as the
+     *              only test, which is why it may only be turned off where a trust store pins exactly
+     *              which certificates this controller trusts
+     */
+    @DataBoundSetter
+    public synchronized void setTlsVerifyNodeIdentity(final boolean value) {
+        this.tlsVerifyNodeIdentity = value;
+        changed();
+    }
+
+    /**
+     * @return the shortest gap between polls of a waiting run's watch, or {@code null} for the
+     *         client's own
+     */
+    public synchronized String getWatchPollPeriod() {
         return watchPollPeriod;
     }
 
     /**
-     * @param value how long to wait after one poll of a watch answered before making the next, as
-     *              {@code 30s}, {@code 2m} or ISO-8601. Blank leaves it to the discas client, which
-     *              polls every second. At least {@code 500ms}
+     * @param value the shortest gap to leave after one poll of a waiting run's watch answered before
+     *              making the next, as {@code 30s}, {@code 2m} or ISO-8601; the gap actually taken is spread up
+     *              to five times it. Blank leaves it to the discas client, whose own period is one
+     *              second. At least {@code 500ms}
      */
     @DataBoundSetter
-    public void setWatchPollPeriod(final String value) {
+    public synchronized void setWatchPollPeriod(final String value) {
         this.watchPollPeriod = trimmed(value);
         changed();
     }
 
+    /**
+     * One Save is one change, whatever it touched.
+     *
+     * <p>The form is bound field by field. {@code binding} stops each setter from saving on its own,
+     * and the one {@link #save()} at the end publishes the whole form to builds at once.
+     */
     @Override
-    @NonNull
+    public synchronized boolean configure(final StaplerRequest2 request, final JSONObject json)
+            throws FormException {
+        // A form that fails half way through binding is put back as it was: the store in use was built
+        // from the old values, and left half bound the fields would no longer be what it was built from.
+        final Settings before = snapshot();
+        binding = true;
+        try {
+            request.bindJSON(this, json);
+        } catch (final RuntimeException notBound) {
+            restore(before);
+            throw notBound;
+        } finally {
+            binding = false;
+        }
+        try {
+            changed();
+        } catch (final InvalidSetting refused) {
+            // Shown beside the field on the page rather than as a stack trace.
+            throw new FormException(refused.getMessage(), refused, refused.field());
+        }
+        return true;
+    }
+
+    /**
+     * Publishes the settings to builds and closes the store built from the previous ones.
+     *
+     * <p>Inside a {@link BulkChange} -- which is how Configuration as Code applies its setters -- this
+     * waits for the commit, so a reload is one change as well.
+     *
+     * <p>Fails closed. Nothing is published until the settings are on disk: {@code Descriptor.save()}
+     * only logs a failed write, which would leave builds on an owner id the controller forgets on
+     * restart. A failed write puts the fields back as last saved and throws.
+     *
+     * <p>Settings which could never build a store are refused before that: an owner id with a
+     * {@code /}, a node list that does not parse, a poll period below the floor. Refused, the fields are
+     * put back as last saved and the store in use stays open, so runs in flight are not revoked for a
+     * typo. Empty fields are not refused, and neither is a combination of TLS settings: setters called
+     * one at a time pass through such states on the way to a valid one.
+     *
+     * <p>The scheduler and the time source it backs are deliberately left alone. A run in flight is
+     * holding both, and what has to happen to it is that its next renewal reaches a closed store and
+     * fails -- which is how it is revoked once its grace period is out. Shut the scheduler down and
+     * there is no next renewal: nothing fails, nothing is revoked, and the run carries on holding work
+     * whose lease another controller is already free to take.
+     *
+     * @throws IllegalArgumentException if a setting could never build a store
+     * @throws UncheckedIOException      if the settings could not be written
+     */
+    @Override
+    public synchronized void save() {
+        if (BulkChange.contains(this)) {
+            return;
+        }
+        final Settings next = snapshot();
+        try {
+            check(next);
+        } catch (final InvalidSetting refused) {
+            restore(applied);
+            throw refused;
+        }
+        try {
+            getConfigFile().write(this);
+        } catch (final IOException failed) {
+            restore(applied);
+            throw new UncheckedIOException(
+                    "Piplex settings could not be saved, the previously saved ones stay in force", failed);
+        }
+        applied = next;
+        final CoordinationStore previous = store;
+        store = null;
+        if (previous != null) {
+            previous.close();
+        }
+        SaveableListener.fireOnChange(this, getConfigFile());
+    }
+
+    private Settings snapshot() {
+        return new Settings(ownerId, clientId, nodes, token, tls, tlsKeystore, tlsKeystorePassword,
+                tlsTruststore, tlsTruststorePassword, tlsVerifyNodeIdentity, watchPollPeriod);
+    }
+
+    private void restore(final Settings settings) {
+        ownerId = settings.ownerId();
+        clientId = settings.clientId();
+        nodes = settings.nodes();
+        token = settings.token();
+        tls = settings.tls();
+        tlsKeystore = settings.tlsKeystore();
+        tlsKeystorePassword = settings.tlsKeystorePassword();
+        tlsTruststore = settings.tlsTruststore();
+        tlsTruststorePassword = settings.tlsTruststorePassword();
+        tlsVerifyNodeIdentity = settings.tlsVerifyNodeIdentity();
+        watchPollPeriod = settings.watchPollPeriod();
+    }
+
+    private static void check(final Settings settings) {
+        try {
+            if (settings.ownerId() != null) {
+                readable(settings.ownerId());
+            }
+        } catch (final AbortException refused) {
+            throw new InvalidSetting("ownerId", refused);
+        }
+        try {
+            cluster(settings);
+        } catch (final AbortException refused) {
+            throw new InvalidSetting("nodes", refused);
+        }
+        try {
+            watchPollPeriod(settings);
+        } catch (final AbortException refused) {
+            throw new InvalidSetting("watchPollPeriod", refused);
+        }
+    }
+
+    /**
+     * A setting {@link #save()} refused, and which field it was in.
+     */
+    static final class InvalidSetting extends IllegalArgumentException {
+        private static final long serialVersionUID = 1L;
+
+        private final String field;
+
+        InvalidSetting(final String field, final AbortException refused) {
+            super(refused.getMessage(), refused);
+            this.field = field;
+        }
+
+        String field() {
+            return field;
+        }
+    }
+
+    /**
+     * Every setting at one moment, to put back when a form cannot be bound or saved.
+     */
+    private record Settings(String ownerId,
+                            String clientId,
+                            String nodes,
+                            Secret token,
+                            boolean tls,
+                            String tlsKeystore,
+                            Secret tlsKeystorePassword,
+                            String tlsTruststore,
+                            Secret tlsTruststorePassword,
+                            boolean tlsVerifyNodeIdentity,
+                            String watchPollPeriod) {
+    }
+
+    @Override
     public String getDisplayName() {
         return "piplex";
     }
@@ -330,21 +500,185 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * @return the primitives
      * @throws AbortException if the controller has not been configured
      */
-    public Piplex piplexFor(final TaskListener listener) throws AbortException {
+    public synchronized Piplex piplexFor(final TaskListener listener) throws AbortException {
         return new Piplex(store(), time(),
                 new TextPiplexObserver(line -> listener.getLogger().println("piplex: " + line)));
     }
 
     /**
-     * @return this controller's identity
-     * @throws AbortException if it has not been set
+     * The owner id and the primitives, from one reading of the settings.
+     *
+     * <p>Asked for separately they are two acquisitions of this monitor, and a Save landing between them
+     * gives a run the old identity and a store built from the new form. {@link #configure} goes to
+     * trouble to make one Save one change; this is the same thing from the reader's side.
+     *
+     * @param listener the run's log
+     * @return both, as one settled answer
+     * @throws AbortException if the controller has not been configured
      */
-    public String requireOwnerId() throws AbortException {
+    public synchronized Configured configuredFor(final TaskListener listener) throws AbortException {
+        final Configured configured = new Configured(requireOwnerId(), piplexFor(listener), time());
+        startHeartbeat();
+        return configured;
+    }
+
+    /**
+     * Starts writing this process's mark under its owner id, once Jenkins is up.
+     */
+    @Initializer(after = InitMilestone.JOB_CONFIG_ADAPTED)
+    public static void startHeartbeatOnStartup() {
+        final PiplexConfiguration configuration = get();
+        if (configuration != null) {
+            configuration.startHeartbeat();
+        }
+    }
+
+    /**
+     * Lets go of everything this controller holds, once its builds are suspended.
+     *
+     * <p>For a JVM that outlives Jenkins -- a servlet container, a test restarting it. Its daemon
+     * threads would otherwise renew the stopped controller's leases for as long as the JVM runs, and
+     * no other controller could take over. The steps go first, so closing the store revokes nothing.
+     */
+    @Terminator(requires = FlowExecutionList.EXECUTIONS_SUSPENDED)
+    public static void stopping() {
+        ExclusiveStepExecution.abandonAll();
+        final PiplexConfiguration configuration = get();
+        if (configuration != null) {
+            configuration.stop();
+        }
+    }
+
+    synchronized void stop() {
+        stopped = true;
+        if (beat != null) {
+            beat.cancel();
+            beat = null;
+        }
+        final CoordinationStore previous = store;
+        store = null;
+        if (previous != null) {
+            previous.close();
+        }
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+            scheduler = null;
+            time = null;
+        }
+    }
+
+    /**
+     * @return the owner id another live controller was seen using lately, or {@code null}
+     */
+    public synchronized String duplicatedOwner() {
+        return heartbeat == null ? null : heartbeat.duplicated();
+    }
+
+    /**
+     * @return the owner id whose heartbeat has not been written lately, or {@code null}
+     */
+    public synchronized String silentOwner() {
+        return heartbeat == null ? null : heartbeat.silent();
+    }
+
+    // Idempotent, and called again by every build: a timer the scheduler refused is armed again then.
+    synchronized void startHeartbeat() {
+        if (beat != null || stopped) {
+            return;
+        }
+        final TimeSource beatTime = suppliedTime != null ? suppliedTime : schedulerTime();
+        if (heartbeat == null) {
+            heartbeat = new OwnerHeartbeat(beatTime);
+        }
+        try {
+            beat = beatTime.schedule(OwnerHeartbeat.EVERY, this::beatThenArm);
+        } catch (final RuntimeException refused) {
+            beat = null;
+        }
+    }
+
+    private synchronized TimeSource schedulerTime() {
+        scheduler();
+        return time;
+    }
+
+    private void beatThenArm() {
+        synchronized (this) {
+            beat = null;
+        }
+        // Outside the monitor, and a configuration Jenkins no longer uses stops here: a reloaded one
+        // runs its own.
+        if (Jenkins.getInstanceOrNull() == null || get() != this) {
+            return;
+        }
+        beatNow().whenComplete((ignored, never) -> startHeartbeat());
+    }
+
+    /**
+     * One beat, now.
+     *
+     * @return completes once it is over; never exceptionally
+     */
+    CompletionStage<Void> beatNow() {
+        final String owner;
+        final CoordinationStore beatStore;
+        final OwnerHeartbeat beating;
+        synchronized (this) {
+            owner = applied.ownerId();
+            beating = heartbeat;
+            CoordinationStore found = null;
+            if (owner != null && owner.indexOf('/') < 0 && beating != null) {
+                try {
+                    found = store();
+                } catch (final AbortException unconfigured) {
+                    found = null;
+                }
+            }
+            beatStore = found;
+        }
+        if (beatStore == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return beating.tick(beatStore, owner);
+    }
+
+    /**
+     * One reading of the settings a run acts on.
+     *
+     * @param ownerId this controller's identity
+     * @param piplex  the primitives, over the store those settings name
+     * @param time    where their time comes from
+     */
+    public record Configured(String ownerId, Piplex piplex, TimeSource time) {
+    }
+
+    /**
+     * @return this controller's identity
+     * @throws AbortException if it has not been set, or cannot be told apart from the run beside it
+     */
+    public synchronized String requireOwnerId() throws AbortException {
+        final String ownerId = applied.ownerId();
         if (ownerId == null) {
             throw new AbortException(
                     "piplex is not configured: set the controller's owner id in Manage Jenkins > System");
         }
+        // save() refuses it too, but a file written before it did is read back as it is.
+        readable(ownerId);
         return ownerId;
+    }
+
+    private static void readable(final String ownerId) throws AbortException {
+        if (ownerId.indexOf('/') >= 0) {
+            // The core escapes each part before joining them, so a slash here can no longer make two
+            // holders share one identity. It is still refused at the door, because this string is also
+            // what a designation names and what every log line and every record carries, and one that
+            // reads as a path is an operator error worth catching where it is asked for -- once, on the
+            // settings page -- rather than leaving in a night's worth of keys.
+            throw new AbortException(
+                    "piplex: the owner id must not contain '/'. It names this controller in the "
+                            + "designation, in the lease and in every log line, and a '/' reads as "
+                            + "structure in all three. Current value: '" + ownerId + "'");
+        }
     }
 
     /**
@@ -366,7 +700,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
         suppliedTime = otherTime;
     }
 
-    private synchronized CoordinationStore store() throws AbortException {
+    synchronized CoordinationStore store() throws AbortException {
         if (supplied != null) {
             return supplied;
         }
@@ -387,35 +721,60 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     }
 
     private void build() throws AbortException {
-        final Map<NodeId, InetSocketAddress> cluster = cluster();
+        final Settings settings = applied;
+        final Map<NodeId, InetSocketAddress> cluster = cluster(settings);
         if (cluster.isEmpty()) {
             throw new AbortException(
                     "piplex is not configured: set the discas nodes in Manage Jenkins > System");
         }
-        final ClientId identity = ClientId.of(clientId == null ? requireOwnerId() : clientId);
+        // Read before the client exists, because it can be refused: a client made first would be one
+        // nobody holds a reference to and nobody closes.
+        final Duration pollPeriod = watchPollPeriod(settings);
+        final ClientId identity = ClientId.of(
+                settings.clientId() == null ? requireOwnerId() : settings.clientId());
         final DisCasClient client = DisCasClientFactory.create(
                 identity,
-                description(),
+                description(settings),
                 new TcpClientBootstrap(cluster, ClientTransportConfig.defaults(),
-                        plainText(token), security()),
+                        plainText(settings.token()), security(settings)),
                 DisCasClientConfig.defaults());
-        scheduler = Executors.newScheduledThreadPool(2, runnable -> {
-            final Thread thread = new Thread(runnable, "piplex");
-            thread.setDaemon(true);
-            return thread;
-        });
-        time = TimeSource.of(scheduler);
+        scheduler();
         // Watches read linearizably because what they return is acted on rather than re-read: the two
         // an admitted run holds revoke it on the value the watch itself returned, so a stale one stops
         // the run late -- which is the overlap window this is here to keep narrow. It is not a setting
         // for that reason. What a nightly job wants instead is a longer poll period, which trades the
         // same latency for the same saving, but explicitly and without depending on how far behind a
         // node happens to be.
-        store = new DiscasCoordinationStore(client, ReadConsistency.LINEARIZABLE, watchPollPeriod(), true);
+        store = new DiscasCoordinationStore(client, ReadConsistency.LINEARIZABLE, pollPeriod, true);
     }
 
     /**
-     * How long a watch waits between polls, or {@code null} to leave that to the discas client.
+     * The timers every run in flight is holding, started once and kept for the life of the controller.
+     *
+     * <p>Package-private for the same reason as {@link #cluster()}: that it survives a settings change
+     * is what makes a run whose store has just been closed fail its next renewal and be revoked, and
+     * the alternative -- no next renewal, no failure, no revocation -- is observable only by waiting out
+     * a grace period that never comes.
+     *
+     * @return the scheduler
+     */
+    synchronized ScheduledExecutorService scheduler() {
+        if (scheduler == null) {
+            final ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(2, runnable -> {
+                final Thread thread = new Thread(runnable, "piplex");
+                thread.setDaemon(true);
+                return thread;
+            });
+            // Every renewal replaces a timer a lease long; left queued once cancelled, they pile up.
+            executor.setRemoveOnCancelPolicy(true);
+            scheduler = executor;
+            time = TimeSource.of(scheduler);
+        }
+        return scheduler;
+    }
+
+    /**
+     * The shortest gap between polls of a watch, or {@code null} to leave that to the discas client.
      *
      * <p>A watch in discas is a poll, not a subscription, and at one second -- the client's default --
      * an hour parked is thousands of consensus rounds per key to learn nothing. A job that runs once a
@@ -423,13 +782,22 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * the standing cost of parking match how often the answer actually changes.
      *
      * <p>What it buys back is bounded by something this cannot reach: a parked candidate looks again
-     * every {@code renewEvery} anyway, so a period longer than that round only removes the polls
-     * inside one round, never the round itself.
+     * every {@code renewEvery} anyway, and a round always ends with a poll, so a period longer than
+     * that round removes the polls inside it and leaves the two at its ends.
+     *
+     * <p>What it costs is bounded by something else -- the gap taken is spread up to five times this,
+     * so an admitted run, which acts on what its own watch returned rather than reading again, hears
+     * of a designation moving or of a {@code disable} up to five periods late.
      *
      * @return the period, or {@code null}
      * @throws AbortException if what was typed is not a duration, or is below discas' floor
      */
     Duration watchPollPeriod() throws AbortException {
+        return watchPollPeriod(applied);
+    }
+
+    private static Duration watchPollPeriod(final Settings settings) throws AbortException {
+        final String watchPollPeriod = settings.watchPollPeriod();
         if (watchPollPeriod == null) {
             return null;
         }
@@ -460,7 +828,14 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * @throws AbortException if TLS was asked for and the stores behind it cannot be loaded
      */
     ClientSecurityProvider security() throws AbortException {
-        if (!tls) {
+        return security(applied);
+    }
+
+    private static ClientSecurityProvider security(final Settings settings) throws AbortException {
+        final Secret token = settings.token();
+        final String tlsKeystore = settings.tlsKeystore();
+        final String tlsTruststore = settings.tlsTruststore();
+        if (!settings.tls()) {
             // Nothing is silently ignored: a store filled in with the box unticked is somebody who
             // believes this connection is encrypted, and it is not.
             if (tlsKeystore != null || tlsTruststore != null) {
@@ -468,37 +843,129 @@ public final class PiplexConfiguration extends GlobalConfiguration {
                         + "is off. Tick 'Connect over TLS' in Manage Jenkins > System, or clear the "
                         + "stores");
             }
+            if (token != null) {
+                // Refused rather than sent, and there is no setting that allows it. The token is this
+                // controller's password to the whole cluster, it goes out at CLIENT_HELLO on every
+                // connection this controller ever makes, and anything on the path can read it once and
+                // then be this controller for as long as the token lives. A cluster worth putting a
+                // token on is a cluster worth putting TLS on.
+                throw new AbortException("piplex: a token is configured but TLS is off, so it would "
+                        + "cross the wire in clear on every connection. Tick 'Connect over TLS' in "
+                        + "Manage Jenkins > System, or clear the token");
+            }
             return PlaintextClientSecurity.PROVIDER;
+        }
+        if (token != null && tlsKeystore != null) {
+            // A discas node authenticates clients one way at a time -- `--client-auth token` or
+            // `--client-auth mtls` -- so filling in both means one of them is not what the cluster is
+            // running, and which one it is cannot be worked out from here. Two profiles are safe, and
+            // both of them are a whole answer on their own.
+            throw new AbortException("piplex: both a token and a client certificate are configured, and "
+                    + "a discas node admits clients one way at a time. Use the token with TLS and no "
+                    + "key store, for a cluster running --client-auth token, or the key store and no "
+                    + "token, for one running --client-auth mtls");
+        }
+        if (!settings.tlsVerifyNodeIdentity() && tlsTruststore == null) {
+            // With the check off, a valid chain is the whole test -- and against the JVM's own trust
+            // store that is no test at all: any host with a certificate from any CA the JVM trusts
+            // answers as the cluster, and is handed the token in the same breath. A trust store makes
+            // it a test again, because then it pins which certificates count.
+            throw new AbortException("piplex: the node identity check is off and no trust store is "
+                    + "configured, so any host with a certificate from any CA this JVM trusts would be "
+                    + "accepted as a discas node. Tick 'Check the node's identity' in Manage Jenkins > "
+                    + "System, or configure a trust store holding the nodes' own certificates. A CA in "
+                    + "the trust store also works, but with the check off it accepts every certificate "
+                    + "that CA ever issues as a node, which is not pinning");
         }
         // Absent means the JVM's own trust store, which is what TrustManagerFactory does with a null
         // KeyStore. Right for a publicly signed node, wrong for the private CA most clusters use --
         // so it is a fallback and not a default worth recommending.
         final KeyStore trust = tlsTruststore == null
                 ? null
-                : pkcs12(tlsTruststore, tlsTruststorePassword, "trust store");
+                : pkcs12(tlsTruststore, settings.tlsTruststorePassword(), "trust store");
         if (tlsKeystore == null) {
             // Server-authenticated TLS: this controller checks the node and presents nothing of its
             // own. Enough under `--client-auth token`, never enough under `--client-auth mtls`.
-            return TlsClientSecurityProvider.serverAuthOnly(TlsConfig.of(sslContext(null, trust)));
+            return TlsClientSecurityProvider.serverAuthOnly(
+                    TlsConfig.of(sslContext(settings, null, trust)));
         }
-        return new TlsClientSecurityProvider(
-                TlsConfig.of(sslContext(pkcs12(tlsKeystore, tlsKeystorePassword, "key store"), trust)));
+        return new TlsClientSecurityProvider(TlsConfig.of(sslContext(settings,
+                pkcs12(tlsKeystore, settings.tlsKeystorePassword(), "key store"), trust)));
     }
 
     // discas wraps every failure here in a bare RuntimeException, so there is no narrower type to
     // catch. What it is worth catching for is the sentence: a key that the store's password does not
     // unlock is an operator error, and it should read as one rather than as a stack trace in a build
     // that was only trying to find out whether it may run.
-    private SSLContext sslContext(final KeyStore key, final KeyStore trust)
+    private static SSLContext sslContext(final Settings settings, final KeyStore key, final KeyStore trust)
             throws AbortException {
         try {
-            return key == null
-                    ? TlsContexts.buildTrustOnly(trust)
-                    : TlsContexts.build(key, password(tlsKeystorePassword), trust);
-        } catch (final RuntimeException notUsable) {
+            if (!settings.tlsVerifyNodeIdentity()) {
+                // Refused above unless a trust store is configured, so what is left here is trust
+                // pinned to the certificates in it -- which is a test of identity of its own, if a
+                // coarser one: the certificate is one of the few this controller was given.
+                return key == null
+                        ? TlsContexts.buildTrustOnly(trust)
+                        : TlsContexts.build(key, password(settings.tlsKeystorePassword()), trust);
+            }
+            return boundToTheNodes(settings, key, trust);
+        } catch (final GeneralSecurityException | RuntimeException notUsable) {
             throw new AbortException("piplex: could not set up TLS from the configured stores: "
                     + rootCause(notUsable));
         }
+    }
+
+    /**
+     * The same context the discas client would have built, with the identity of what answers checked
+     * after its chain is.
+     *
+     * <p>Built here rather than by {@link TlsContexts} because the trust managers have to be wrapped
+     * before the context is initialised with them, and that is the only difference: the protocol is
+     * {@link TlsContexts#PROTOCOL}, the same one every other discas connection uses.
+     *
+     * @param settings the settings being built from
+     * @param key   this controller's own certificate, or {@code null} to present none
+     * @param trust what the nodes' certificates must chain to, or {@code null} for the JVM's own
+     * @return the context
+     * @throws GeneralSecurityException if the stores cannot be turned into managers
+     * @throws AbortException           if no nodes are configured to check an identity against
+     */
+    private static SSLContext boundToTheNodes(final Settings settings, final KeyStore key, final KeyStore trust)
+            throws GeneralSecurityException, AbortException {
+        final TrustManagerFactory trusted =
+                TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        trusted.init(trust);
+        KeyManager[] presented = null;
+        if (key != null) {
+            final KeyManagerFactory keys =
+                    KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+            keys.init(key, password(settings.tlsKeystorePassword()));
+            presented = keys.getKeyManagers();
+        }
+        final SSLContext context = SSLContext.getInstance(TlsContexts.PROTOCOL);
+        context.init(presented, NodeIdentity.checkedAgainst(trusted.getTrustManagers(), nodeNames(settings)),
+                null);
+        return context;
+    }
+
+    /**
+     * @param settings the settings being built from
+     * @return every name a node of this cluster may be recognised by: its node id, and the host it was
+     *         configured under
+     * @throws AbortException if no nodes are configured, since then nothing would be recognised
+     */
+    private static Set<String> nodeNames(final Settings settings) throws AbortException {
+        final Set<String> names = new LinkedHashSet<>();
+        for (final Map.Entry<NodeId, InetSocketAddress> node : cluster(settings).entrySet()) {
+            names.add(node.getKey().value());
+            names.add(node.getValue().getHostString());
+        }
+        if (names.isEmpty()) {
+            throw new AbortException("piplex: TLS is configured and no discas nodes are, so there is "
+                    + "nothing to check the certificate a node presents against. Fill in 'discas "
+                    + "nodes' in Manage Jenkins > System");
+        }
+        return names;
     }
 
     // Read on every build of the store rather than held open, so that a rotated certificate is picked
@@ -556,6 +1023,11 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     // Package-private: what it produces goes out at CLIENT_HELLO and is never read back here, so the
     // bound it has to respect is otherwise checkable only by connecting.
     ClientDescription description() {
+        return description(applied);
+    }
+
+    private static ClientDescription description(final Settings settings) {
+        final String ownerId = settings.ownerId();
         final String owner = ownerId == null || ownerId.isEmpty() ? null : ownerId;
         return ClientDescription.of(truncate(owner == null
                 ? "piplex Jenkins plugin"
@@ -578,17 +1050,12 @@ public final class PiplexConfiguration extends GlobalConfiguration {
         return shortened;
     }
 
+    // Called from every setter, and once more by configure() for the whole form -- which is why a
+    // setter called while the form is being bound does nothing here and leaves it to that last call.
+    // Inside a BulkChange, save() itself waits for the commit.
     private synchronized void changed() {
-        final CoordinationStore previous = store;
-        final ScheduledExecutorService previousScheduler = scheduler;
-        store = null;
-        time = null;
-        scheduler = null;
-        if (previous != null) {
-            previous.close();
-        }
-        if (previousScheduler != null) {
-            previousScheduler.shutdownNow();
+        if (binding) {
+            return;
         }
         save();
     }
@@ -596,6 +1063,11 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     // Package-private for the same reason as description(): what it parsed is otherwise observable
     // only by watching where a client dials.
     Map<NodeId, InetSocketAddress> cluster() throws AbortException {
+        return cluster(applied);
+    }
+
+    private static Map<NodeId, InetSocketAddress> cluster(final Settings settings) throws AbortException {
+        final String nodes = settings.nodes();
         final Map<NodeId, InetSocketAddress> cluster = new LinkedHashMap<>();
         if (nodes == null) {
             return cluster;
@@ -604,23 +1076,70 @@ public final class PiplexConfiguration extends GlobalConfiguration {
             if (entry.isBlank()) {
                 continue;
             }
-            final String[] parts = entry.split("[=:]");
-            if (parts.length != 3) {
-                throw new AbortException("piplex: expected nodeId=host:port, got '" + entry + "'");
+            final int equals = entry.indexOf('=');
+            if (equals < 1 || equals == entry.length() - 1) {
+                throw new AbortException(expected(entry));
             }
-            cluster.put(NodeId.of(parts[0]), new InetSocketAddress(parts[1], port(parts[2], entry)));
+            final String address = entry.substring(equals + 1);
+            // Split at the last colon rather than at every one: an IPv6 literal is mostly colons, and
+            // the only way to write one that a host:port can be read out of is bracketed. After the
+            // closing bracket is the one position the port can be in.
+            final int colon = address.lastIndexOf(':');
+            if (colon < 1 || colon < address.lastIndexOf(']')) {
+                throw new AbortException(expected(entry));
+            }
+            // An unbracketed literal parses: `fe80::1` splits into the host `fe80:` and the port 1, and
+            // the client then dials a name that does not resolve with a sentence about DNS. Refused
+            // here, where the fix -- the brackets -- is what the message already says.
+            if (address.indexOf(':') != colon && address.charAt(0) != '[') {
+                throw new AbortException(expected(entry));
+            }
+            final NodeId node = NodeId.of(entry.substring(0, equals));
+            // put() would keep the last of them and say nothing, so a cluster of three typed with one
+            // id twice becomes a cluster of two -- and a quorum counted on the wrong number.
+            if (cluster.containsKey(node)) {
+                throw new AbortException("piplex: the discas node id '" + node.value()
+                        + "' is listed more than once. Each node needs an id of its own, as "
+                        + "nodeId=host:port");
+            }
+            cluster.put(node, new InetSocketAddress(host(address.substring(0, colon), entry),
+                    port(address.substring(colon + 1), entry)));
         }
         return cluster;
     }
 
+    // A bracketed IPv6 literal is unwrapped: the brackets are there to say where the address ends, and
+    // InetSocketAddress wants the address without them.
+    private static String host(final String text, final String entry) throws AbortException {
+        if (text.charAt(0) != '[') {
+            return text;
+        }
+        if (text.length() < 3 || text.charAt(text.length() - 1) != ']') {
+            throw new AbortException(expected(entry));
+        }
+        return text.substring(1, text.length() - 1);
+    }
+
     private static int port(final String text, final String entry) throws AbortException {
+        final int port;
         try {
-            return Integer.parseInt(text);
+            port = Integer.parseInt(text);
         } catch (final NumberFormatException notANumber) {
             // Typed into a form by a person, so it is worth the same sentence the rest of the entry
             // gets rather than a NumberFormatException from somewhere down the stack.
-            throw new AbortException("piplex: expected nodeId=host:port, got '" + entry + "'");
+            throw new AbortException(expected(entry));
         }
+        // Refused here rather than by InetSocketAddress, which throws IllegalArgumentException past
+        // every AbortException in this class and reaches the build as a stack trace.
+        if (port < 1 || port > 65535) {
+            throw new AbortException("piplex: the port in '" + entry + "' must be 1-65535, got " + port);
+        }
+        return port;
+    }
+
+    private static String expected(final String entry) {
+        return "piplex: expected nodeId=host:port, got '" + entry
+                + "'. An IPv6 address goes in brackets, as nodeId=[2001:db8::1]:7101";
     }
 
     private static String trimmed(final String value) {

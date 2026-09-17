@@ -11,26 +11,14 @@ import java.time.Duration;
 import java.util.concurrent.CompletionStage;
 
 /**
- * The small amount of shared state piplex needs, and nothing more: a linearizable compare-and-set per
- * key, a way to wait for a key to change, and a lease with a fencing token.
+ * Linearizable key state, bounded change waits and fenced leases required by piplex.
  *
- * <p>Every coordination store worth using offers these -- discas, etcd, Consul, ZooKeeper -- so keeping
- * the surface this narrow is what lets the engine be written once and tested without a cluster.
+ * <p>All operations are asynchronous and must complete within {@link #responseBound()}, with
+ * {@code maxWait} added for change waits. A failed stage may represent an unknown outcome. Retrying a
+ * version-fenced {@link #compareAndSet} is safe; other operations require their documented recovery.
  *
- * <p>Implementations are <b>constructed explicitly</b> and handed to the primitives. There is no
- * discovery, no {@code ServiceLoader}, and nothing on the classpath decides which one is in use:
- *
- * <pre>{@code
- * CoordinationStore store = new DiscasCoordinationStore(client);
- * ExclusiveRuns runs = new ExclusiveRuns(store, TimeSource.of(scheduler));
- * }</pre>
- *
- * <p>Everything is asynchronous because the stores underneath are. Nothing here blocks, and completions
- * may run on a store-owned thread -- hop off it before doing work of any length.
- *
- * <p><b>On failure.</b> A failed stage means the operation may or may not have taken effect unless the
- * implementation documents otherwise. A version-fenced {@link #compareAndSet} is safe to re-send under
- * an unknown outcome, because a stale expected version cannot apply twice. Nothing else here is.
+ * <p>Primitives wrap implementations in {@link FailFastStore}, converting synchronous failures and
+ * non-completing stages into failed stages.
  */
 public interface CoordinationStore extends AutoCloseable {
 
@@ -39,6 +27,11 @@ public interface CoordinationStore extends AutoCloseable {
      * {@link #compareAndSet} expects in order to create a key which must not already exist.
      */
     String INITIAL_VERSION = "";
+
+    /**
+     * What {@link #responseBound()} is unless a store says otherwise.
+     */
+    Duration DEFAULT_RESPONSE_BOUND = Duration.ofMinutes(5);
 
     /**
      * Reads a key.
@@ -84,13 +77,39 @@ public interface CoordinationStore extends AutoCloseable {
      * <p>It does not remove the loop from the caller: whatever waits still re-reads and compares after
      * every return. It makes each turn of that loop the best the store can do.
      *
+     * <p>A store which could not reach the key at the end of the wait may answer with the newest state
+     * it saw before that, rather than failing: the caller asked to be told within {@code maxWait}, and
+     * an outage that lifts inside the budget is the store's to absorb. What it returns is then
+     * {@link Entry#confirmed() unconfirmed}, and it can be a whole wait old. A caller which only wants
+     * to know when to look again may ignore that; one which counts how long it has been since it last
+     * learnt anything about the key must treat it as having learnt nothing.
+     *
      * @param key          the key
      * @param sinceVersion the version already seen, or {@link #INITIAL_VERSION} to return as soon as
      *                     the key holds anything
      * @param maxWait      how long to wait before returning the current state unchanged
-     * @return the state in force when the wait ended
+     * @return the state in force when the wait ended, or the newest seen and marked unconfirmed
      */
     CompletionStage<Entry> awaitChange(String key, String sinceVersion, Duration maxWait);
+
+    /**
+     * Waits for a key to change, saying how soon the caller must hear of it.
+     *
+     * <p>A store whose watches all cost the same need not tell the two apart, and by default this is
+     * {@link #awaitChange(String, String, Duration)}. A store which wraps another must pass the hint on.
+     *
+     * @param key          the key
+     * @param sinceVersion as for {@link #awaitChange(String, String, Duration)}
+     * @param maxWait      as for {@link #awaitChange(String, String, Duration)}
+     * @param watch        how soon the caller must hear of a change
+     * @return as for {@link #awaitChange(String, String, Duration)}
+     */
+    default CompletionStage<Entry> awaitChange(final String key,
+                                               final String sinceVersion,
+                                               final Duration maxWait,
+                                               final Watch watch) {
+        return awaitChange(key, sinceVersion, maxWait);
+    }
 
     /**
      * Asks for the lease on a key without waiting for it.
@@ -111,7 +130,8 @@ public interface CoordinationStore extends AutoCloseable {
      * @param handle the handle acquisition returned
      * @param ttl    how much longer it should last
      * @return {@code true} when extended; {@code false} when the lease was lapsed or taken, and the
-     *         caller must stop treating itself as the holder
+     *         caller must stop treating itself as the holder. A failed stage is neither: it says the
+     *         outcome could not be learnt, which is what a holder tolerates for its renewal grace
      */
     CompletionStage<Boolean> renew(String key, LeaseHandle handle, Duration ttl);
 
@@ -120,9 +140,21 @@ public interface CoordinationStore extends AutoCloseable {
      *
      * @param key    the key the lease is on
      * @param handle the handle acquisition returned
-     * @return completion
+     * @return completion; a failed stage says the lease may still be standing, and the next run waits
+     *         it out
      */
     CompletionStage<Void> release(String key, LeaseHandle handle);
+
+    /**
+     * How long a stage of this store may take, past the wait asked for. It is a backstop against a
+     * stage that never completes, not a timeout to tune: set it above the longest a call can
+     * legitimately take, retries included.
+     *
+     * @return a positive duration; five minutes unless the store says otherwise
+     */
+    default Duration responseBound() {
+        return DEFAULT_RESPONSE_BOUND;
+    }
 
     @Override
     void close();

@@ -7,7 +7,6 @@
 
 package io.github.green4j.piplex.jenkins;
 
-import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.model.Run;
 import hudson.model.TaskListener;
@@ -22,26 +21,10 @@ import org.kohsuke.stapler.DataBoundSetter;
 import java.util.Set;
 
 /**
- * {@code piplexExclusive} -- run this only on the controller that is allowed to, and stop if that
- * changes.
+ * {@code piplexExclusive} -- runs its body only while this controller holds the requested ownership.
  *
- * <p>It takes a block, and that one decision buys both shapes it needs to have:
- *
- * <pre>
- * options { piplexExclusive(key: 'eod', designatedBy: 'eod', generation: env.BUSINESS_DATE) }
- * </pre>
- *
- * <p>wraps the whole build, which is what a nightly job wants, and
- *
- * <pre>
- * piplexExclusive(key: 'eod') { sh './eod.sh' }
- * </pre>
- *
- * <p>wraps one stage. This is how {@code timeout} and {@code retry} work, and it is the only shape that
- * can <b>stop</b> anything: a gate in the first stage has nothing left to interrupt once it has let the
- * build through.
- *
- * <p>What the parameters mean is in {@code piplex-core}; they are passed through unchanged.
+ * <p>It may wrap a whole declarative build in {@code options} or one scripted block. The lease defaults
+ * to 60 seconds; {@code handoverWait} defaults to zero. Revocation cancels the body.
  */
 public final class PiplexExclusiveStep extends Step {
 
@@ -53,6 +36,7 @@ public final class PiplexExclusiveStep extends Step {
     private String lease;
     private String renewEvery;
     private String renewalGrace;
+    private String guardGrace;
     private String handoverWait;
 
     /**
@@ -152,6 +136,19 @@ public final class PiplexExclusiveStep extends Step {
         this.renewalGrace = value;
     }
 
+    public String getGuardGrace() {
+        return guardGrace;
+    }
+
+    /**
+     * @param value how long a designation or switch which cannot be read at all is tolerated before
+     *              ownership is given up
+     */
+    @DataBoundSetter
+    public void setGuardGrace(final String value) {
+        this.guardGrace = value;
+    }
+
     public String getHandoverWait() {
         return handoverWait;
     }
@@ -165,7 +162,7 @@ public final class PiplexExclusiveStep extends Step {
     }
 
     @Override
-    public StepExecution start(final StepContext context) {
+    public StepExecution start(final StepContext context) throws Exception {
         return new ExclusiveStepExecution(context, this);
     }
 
@@ -184,7 +181,6 @@ public final class PiplexExclusiveStep extends Step {
         }
 
         @Override
-        @NonNull
         public String getDisplayName() {
             return "Run only where piplex allows it";
         }

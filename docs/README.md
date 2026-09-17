@@ -1,74 +1,51 @@
 ## piplex documentation
 
-The [README](../README.md) says what piplex is and why it exists. These pages say how it works.
+Start with the [Quick start](00-quick-start.md). It builds a two-controller setup and exercises a
+handover, a drain and a cross-controller milestone.
 
-**New here? Start with the [Quick start](00-quick-start.md).** It sets up two controllers running one
-nightly job, end to end, in about twenty minutes. The other pages explain what you just built.
-
-| Page | Read it to |
+| Page | Use it to |
 |---|---|
-| [0. Quick start](00-quick-start.md) | get a working two-controller setup, step by step |
-| [1. The model](01-model.md) | understand the store underneath, the four keys, and why everything compares state |
-| [2. Exclusive run](02-exclusive-run.md) | know who is allowed to run the work, and how a handover happens |
-| [3. Milestones](03-milestones.md) | publish how far a producer got, and wait for it |
-| [4. Switches](04-switches.md) | turn work off everywhere in a second |
-| [5. The Jenkins plugin](05-jenkins.md) | learn the three steps in full, where to put them in a branching pipeline, and what a restart does to them |
-| [6. Operating piplex](06-operations.md) | run the usual procedures, and diagnose what went wrong |
-| [7. discas, ACLs and TLS](07-discas.md) | stand up the cluster, and decide how much security it needs |
+| [0. Quick start](00-quick-start.md) | Install and run the first coordinated job |
+| [1. Model](01-model.md) | Understand state, identity, time and guarantees |
+| [2. Exclusive runs](02-exclusive-run.md) | Configure election, designation and handover |
+| [3. Milestones](03-milestones.md) | Publish and await completed generations |
+| [4. Switches](04-switches.md) | Disable all work or drain one owner |
+| [5. Jenkins](05-jenkins.md) | Configure the plugin and use its four Pipeline steps |
+| [6. Operations](06-operations.md) | Run handovers, diagnose failures and size watches |
+| [7. discas and security](07-discas.md) | Configure the cluster, TLS and ACLs |
+| [8. Lifecycle](08-lifecycle.md) | Upgrade, roll back and recover |
 
-### The shape of the thing
+### Architecture
 
-Several controllers run the same pipeline. Each has its own piplex. They agree through one store:
+Each controller has its own stable `ownerId` and talks to the same coordination store. Controllers do
+not call one another.
 
 ```mermaid
 flowchart LR
-    subgraph blue["Jenkins euc1-blue"]
-        PB["piplex<br/>ownerId: euc1-blue"]
-    end
-    subgraph green["Jenkins euc1-green"]
-        PG["piplex<br/>ownerId: euc1-green"]
-    end
-    subgraph apac["Jenkins apac1"]
-        PA["piplex<br/>ownerId: apac1"]
-    end
-
-    STORE[("coordination store<br/>discas cluster")]
-
-    PB <--> STORE
-    PG <--> STORE
-    PA <--> STORE
-
-    OPS(["operator"]) -- "designate / disable" --> STORE
+    Blue["Jenkins: euc1-blue"] <--> Store[("discas")]
+    Green["Jenkins: euc1-green"] <--> Store
+    Operator["Operator job"] --> Store
 ```
 
-Nothing flows between the controllers. They never learn of each other except through what the store
-says. That is why adding a fourth one is a configuration change and not a topology change.
+`piplex-core` defines the primitives and `CoordinationStore`; `piplex-discas` implements that
+interface; `piplex-jenkins` adapts the primitives to `piplexExclusive`, `piplexPublish`,
+`piplexAwait` and `piplexToken`.
 
-### What lives where
+### Runnable examples
 
-```mermaid
-flowchart TD
-    subgraph core["piplex-core -- depends on no store, no host"]
-        RUNS["ExclusiveRuns<br/>Designations"]
-        MS["Milestones"]
-        SW["Switches"]
-        IF{{"CoordinationStore<br/>one interface"}}
-        RUNS --> IF
-        MS --> IF
-        SW --> IF
-    end
+Run an example from the repository with:
 
-    IF -.implemented by.-> DISCAS["piplex-discas<br/>DiscasCoordinationStore"]
-    IF -.implemented by.-> MEM["InMemoryCoordinationStore<br/>ships in core, for tests and small hosts"]
-
-    JEN["piplex-jenkins<br/>piplexExclusive, piplexPublish, piplexAwait"] --> RUNS
-    JEN --> MS
-    DISCAS --> CLUSTER[("discas")]
+```text
+./gradlew :piplex-example:run -PmainClass=ElectedRunExample
 ```
 
-Implementations are constructed explicitly and passed in. There is no `ServiceLoader`, and nothing is
-discovered at runtime. Swapping the store is a diff somebody can read.
+| Main class | Demonstrates |
+|---|---|
+| `ElectedRunExample` | Lease election |
+| `DesignatedHandoverExample` | Designation and takeover |
+| `DrainSwitchExample` | Shared and per-owner switches |
+| `MilestoneExample` | Monotonic publish and level-triggered wait |
+| `DiscasStoreExample` | A real discas-backed store |
 
-`piplex-core` carries one store of its own, the in-memory one, and depends on no host or cluster. The
-build enforces that rather than trusting it: `checkCoreIsHostAgnostic` fails if anything outside
-`io.github.green4j` reaches the core's runtime classpath.
+The modules are not published to Maven and carry no API-stability promise. They ship together in the
+Jenkins `.hpi`.

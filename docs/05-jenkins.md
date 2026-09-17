@@ -1,393 +1,276 @@
 ## 5. The Jenkins plugin
 
-Three steps and one configuration section. The plugin is an adapter and nothing more: it parses
-parameters, calls the core, and turns an answer into a Jenkins outcome.
+The plugin configures one shared store per controller and exposes four Pipeline steps:
+`piplexExclusive`, `piplexPublish`, `piplexAwait` and `piplexToken`.
 
-For a working setup from scratch, see the [Quick start](00-quick-start.md). This page is the reference.
+[Stored keys](01-model.md#stored-keys) shows which discas key each step parameter reads or writes.
 
-### Configuring a controller
+### Controller configuration
 
-**Manage Jenkins > System > piplex**
+Open **Manage Jenkins > System > piplex**.
 
-| Field | Example | Notes |
-|---|---|---|
-| `ownerId` | `euc1-blue` | this controller's identity. Required, and typed in by hand on purpose |
-| `clientId` | `piplex-euc1` | what it connects to discas as. Defaults to `ownerId` |
-| `nodes` | `n1=10.0.0.1:7101, n2=10.0.0.2:7101` | the cluster. Comma- or newline-separated |
-| `watchPollPeriod` | *(blank)* | how long a watch waits between polls. Blank means the client's own, one second. See [cost of watching](06-operations.md#cost-of-watching) |
-| `token` | *(secret)* | for a cluster running `--client-auth token`. Blank for the other modes |
-| `tls` | `false` | whether to connect over TLS. Nothing below takes effect without it |
-| `tlsTruststore` | `/etc/discas/tls/client-ca.p12` | the CA the nodes are checked against. Blank means the JVM's own |
-| `tlsTruststorePassword` | *(secret)* | usually blank |
-| `tlsKeystore` | `/etc/discas/tls/euc1-blue.p12` | this controller's own certificate. Required under `--client-auth mtls` |
-| `tlsKeystorePassword` | *(secret)* | opens the key store, and the key inside it |
+| Field | Meaning |
+|---|---|
+| `ownerId` | Stable identity named by designations; unique per controller |
+| `clientId` | Identity presented to discas; defaults to `ownerId` |
+| `nodes` | Comma- or whitespace-separated `nodeId=host:port` entries |
+| `token` | Shared token for discas token authentication |
+| `tls` | Encrypt and authenticate the server connection |
+| `tlsKeystore` | PKCS12 client certificate and key for mTLS |
+| `tlsTruststore` | PKCS12 trust anchors for discas nodes |
+| `tlsVerifyNodeIdentity` | Require a node certificate to name a configured node; default `true` |
+| `watchPollPeriod` | Poll floor for background waits; blank uses the client default |
 
-The three modes and what to fill in for each are in
-[discas, ACLs and TLS](07-discas.md#connecting-jenkins-to-it).
+IPv6 addresses require brackets: `n1=[2001:db8::1]:7101`.
 
-The section is a `GlobalConfiguration` carrying `@Symbol("piplex")`, so Configuration as Code addresses
-it the way it addresses any other:
+The supported security combinations are:
+
+- trusted network: no token, no TLS;
+- token authentication: token plus TLS, no client keystore;
+- mTLS: TLS plus client keystore, no token.
+
+Unsafe or ambiguous combinations fail before a store is built. See
+[discas and security](07-discas.md).
+
+Configuration as Code uses the `piplex` symbol:
 
 ```yaml
 unclassified:
   piplex:
+    # Name of this controller. Goal: let designations point at it.
+    # Effect: builds run here only when a designation names this value
     ownerId: "euc1-blue"
-    clientId: "piplex-euc1"
-    nodes: "n1=10.0.0.1:7101, n2=10.0.0.2:7101, n3=10.0.0.3:7101"
-    watchPollPeriod: "30s"
+    # Identity presented to discas. Goal: authenticate and apply ACLs per controller
+    clientId: "piplex-euc1-blue"
+    # discas cluster members. Goal: reach the shared state
+    nodes: "n1=10.0.0.11:7101,n2=10.0.0.12:7101,n3=10.0.0.13:7101"
+    # Shared secret, resolved from a CasC variable. Goal: authenticate to discas
+    token: "${PIPLEX_TOKEN}"
+    # Encrypted connection. Goal: protect the token; required with it
     tls: true
-    tlsTruststore: "/etc/discas/tls/client-ca.p12"
-    tlsKeystore: "/etc/discas/tls/euc1-blue.p12"
-    tlsKeystorePassword: "${PIPLEX_KEYSTORE_PASSWORD}"
+    # Goal: reject a server that is not a configured node.
+    # Effect: the node certificate must name one of the nodes above
+    tlsVerifyNodeIdentity: true
+    # Trust anchors for discas node certificates
+    tlsTruststore: "/run/secrets/discas-trust.p12"
+    # Lower bound between polls in background waits. Goal: limit load on discas
+    watchPollPeriod: "30s"
 ```
 
-That is the standard shape for this kind of extension rather than something the plugin does specially.
-But **nothing in the test suite covers it** -- the tests configure the section directly. Try it on one
-controller before rolling it out.
+For mTLS, omit `token` and add `tlsKeystore` plus its password.
+Token and password fields are Jenkins `Secret` values: encrypted in the configuration XML and
+resolvable from CasC variables rather than written directly into YAML.
 
-There is no `doCheck` validation on these fields yet, so a typo in `nodes` surfaces as a failed build
-rather than a red field. See [operations](06-operations.md#a-typo-in-nodes).
+#### Saving configuration
 
-The two passwords and the token are Jenkins `Secret` values: encrypted at rest, never rendered back
-into the form, and resolvable from a CasC variable rather than written into the YAML.
+One Save publishes all fields atomically to builds. Invalid `ownerId`, `nodes` or
+`watchPollPeriod` values are rejected without replacing the current settings.
 
-#### Changing a setting closes the store
+A successful Save closes the previous store. Runs using it stop renewing and are revoked when their
+safe deadline is reached; the scheduler remains alive so those failures are observed. Change settings
+when no guarded work is running, or accept that revocation.
 
-The store is built on first use and kept:
-
-```mermaid
-stateDiagram-v2
-    [*] --> Unbuilt
-    Unbuilt --> Live: first step asks for it
-    Live --> Unbuilt: any setting changed<br/>(store closed, scheduler shut down)
-```
-
-That has a cost worth stating plainly, because it is not the obvious behaviour. **A run in flight is
-holding that store.** Its renewals stop, and it is revoked once its grace period is out, exactly as if
-the cluster had gone away.
-
-It is still the right way round. The alternative is a live connection under an identity the operator has
-just changed, left open because something might still be using it -- one more of them after every edit,
-none of them ever closed.
+The controller also writes `piplex/instances/<ownerId>` every 30 seconds. Seeing another process mark
+under the same owner activates an administrative warning and logs a warning in builds.
 
 ### `piplexExclusive`
 
-A **block** step. That one decision buys both shapes it needs:
+The step guards a body:
 
 ```groovy
-// the whole build -- what a nightly job wants
-options { piplexExclusive(key: 'eod', designatedBy: 'eod', generation: env.BUSINESS_DATE) }
+// Whole build. Goal: guard every stage and post together
+options {
+    // Name of the protected work. Effect: one build at a time across controllers
+    piplexExclusive key: 'eod',
+                    // Designation to follow. Effect: runs only where it names this controller
+                    designatedBy: 'eod-owner',
+                    // Unit of work this build produces. Effect: checked against completedWhen
+                    generation: params.BUSINESS_DATE
+}
 
-// one stage
-piplexExclusive(key: 'eod') { sh './eod.sh' }
+// Block. Goal: guard only the enclosed steps.
+// Effect: without designatedBy, the first controller to take the lease runs
+piplexExclusive(key: 'eod') {
+    sh './eod.sh'
+}
 ```
 
-This is how `timeout` and `retry` work, and it is the only shape that can **stop** anything. A gate in
-the first stage has nothing left to interrupt once it has let the build through.
+The whole-build `options` form is appropriate for one indivisible operation. The block form guards a
+stage or branch. A gate that returns before the work cannot stop that work later, which is why this is
+a wrapper.
 
-| Parameter | Default | |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `key` | required | what is being competed for |
-| `designatedBy` | unset | the key naming the owner; unset elects instead |
-| `generation` | unset | usually `env.BUSINESS_DATE` |
-| `completedWhen` | unset | the milestone that means there is nothing to do |
-| `enabledBy` | unset | the switch to consult and be stopped by |
-| `lease` | `60s` | the handover bound, not the work's duration |
-| `renewEvery` | `lease / 3` | |
-| `renewalGrace` | `lease` | |
-| `handoverWait` | `0` | how long to park rather than end the build |
+| `key` | required | Resource being protected |
+| `designatedBy` | unset | Designation key; unset elects |
+| `generation` | unset | Work generation |
+| `completedWhen` | unset | Milestone that makes the generation unnecessary |
+| `enabledBy` | unset | Shared and per-owner switches to consult |
+| `lease` | `60s` | Lease term and failed-holder handover bound |
+| `renewEvery` | `lease / 3` | Renewal interval |
+| `renewalGrace` | `lease` | Silence tolerated from lease operations |
+| `guardGrace` | `renewalGrace` | Time a guard may remain unreadable |
+| `handoverWait` | `0` | Time a candidate may park |
 
-Durations accept `30s`, `90m`, `4h`, `7d` or ISO-8601 `PT1H30M`.
+Durations accept `30s`, `90m`, `4h`, `7d` or ISO-8601 such as `PT1H30M`.
 
-`ownerId` and `runId` are not parameters. The first comes from the controller's configuration. The
-second is the build's own full display name, which is what a reader of two logs needs to tell them
-apart, and what makes a second run on this controller lose the lease rather than share it.
+The step holds no executor while acquiring or parking. It derives `ownerId` from controller
+configuration, `runId` from the build and a stable `executionId` from the block, so parallel asks by
+one build do not share a lease.
 
-#### What it does to the build
+The block returns `null`, because a body value cannot be recovered consistently across a controller
+restart.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant J as Jenkins
-    participant E as ExclusiveStepExecution
-    participant C as piplex core
-    participant S as store
+After the body ends, the step waits up to 15 seconds for release without blocking the CPS VM thread.
+A failed or timed-out release is not a build failure; the lease is left to lapse before takeover.
 
-    J->>E: start()
-    E->>C: begin(request)
-    E-->>J: false -- no executor held
-    C->>S: read, then acquire
-    alt admitted
-        C-->>E: Admitted
-        E->>E: register onRevoked
-        E->>J: start the body
-        Note over J: the guarded work runs
-        J-->>E: body finished
-        E->>S: release the lease (waits, up to 15s)
-        E-->>J: step complete
-    else not ours
-        C-->>E: NotDesignated / HeldByOther / AlreadyCompleted / Disabled
-        E-->>J: FlowInterruptedException, NOT_BUILT
-    end
+#### Results
+
+| Situation | Build result |
+|---|---|
+| Not designated, lease held elsewhere, contention, already complete or disabled | `NOT_BUILT` |
+| Guard record cannot be parsed or initial store call fails | `FAILURE` |
+| Ownership is revoked after work starts | `ABORTED` |
+| Ownership cannot be retaken on resume | `ABORTED` |
+| Resume gets a different fencing token | `ABORTED` |
+| Saved step state is newer than the installed plugin understands | `ABORTED` |
+
+Each non-success carries a message or `CauseOfInterruption` that identifies the key and reason.
+
+#### Completion order
+
+With `completedWhen`, the milestone must be published before the exclusive lease is released.
+
+In a declarative whole-build wrapper, `post` is inside `options`, so this is safe:
+
+```groovy
+options {
+    piplexExclusive key: 'eod',
+                    // Milestone the producer publishes. Goal: never redo a finished date.
+                    // Effect: the build ends NOT_BUILT if it has this generation or later
+                    completedWhen: 'data/euc1',
+                    generation: params.BUSINESS_DATE
+}
+post {
+    success {
+        // Still inside the lease. Effect: no other build can repeat the generation
+        piplexPublish key: 'data/euc1', generation: params.BUSINESS_DATE
+    }
+}
 ```
 
-**It never occupies an executor.** `start()` returns `false`, so a controller that is not the one that
-has to run parks for four hours without holding a node, an executor or a thread. There is a
-`FlowExecution` in memory and nothing else.
+In a scripted pipeline, publish inside the block:
 
-That is what makes it reasonable to put the same schedule on every controller and let them sort it out.
-
-Revocation while the body runs:
-
-```mermaid
-sequenceDiagram
-    participant S as store
-    participant E as ExclusiveStepExecution
-    participant J as Jenkins
-    S-->>E: designation moved (on a piplex thread)
-    E->>J: body.cancel(PiplexInterruption.revoked)
-    Note over J: Jenkins stops the body its own way
-    J-->>E: body finished
-    E->>S: release the lease
+```groovy
+piplexExclusive(key: 'eod', completedWhen: 'data/euc1',
+                generation: params.BUSINESS_DATE) {
+    sh './eod.sh'
+    // Inside the block. Effect: published before the lease is released
+    piplexPublish key: 'data/euc1', generation: params.BUSINESS_DATE
+}
 ```
 
-The listener does one thing: ask Jenkins to cancel. The stopping itself happens where Jenkins does it.
+Publishing outside the scripted block creates a release-before-publish gap in which another candidate
+can repeat the generation.
 
-The release is **waited for**, up to 15 seconds. Until the lease is gone, the controller taking over has
-to wait for it to lapse, and that wait is the handover. Bounded, because a store that has stopped
-answering must not also stop the build from finishing, and an unreleased lease lapses on its own.
+#### Restart
 
-#### Build results
+Live leases, timers and watches are not serialized. On resume the step asks again under the same
+execution identity.
 
-Getting this wrong is how a team learns to ignore its own build page. Three controllers a night going
-red for doing exactly what they were told is not a signal.
+- A parked step waits only for the active portion of `handoverWait` not already spent. Controller
+  downtime is not counted.
+- A body already started is never started again and cannot park. It continues only if ownership is
+  retaken with the same fencing token.
+- If the lease was lost, the guards refuse admission, or a new acquisition has a higher token, Jenkins
+  cancels the resumed body and marks the build `ABORTED`.
+- Unknown newer saved-state versions fail rather than guessing during a plugin rollback.
 
-| Situation | Result | Shown on the build |
-|---|---|---|
-| not designated | `NOT_BUILT` | `piplex: did not run 'eod' because 'euc1-green' is designated to run it` |
-| nobody designated yet | `NOT_BUILT` | `... because nobody is designated to run it yet` |
-| another run holds it | `NOT_BUILT` | `... because 'euc1-blue/eod #142' is running it` |
-| already done | `NOT_BUILT` | `... because it is already done up to 2026-09-12` |
-| switched off | `NOT_BUILT` | `... because it is switched off: INC-4821` |
-| **revoked mid-run** | `ABORTED` | work started and was stopped |
-| **lost on resume** | `ABORTED` | this build built something before the restart |
+`onResume()` cannot block, so Jenkins may replay a body while the asynchronous ownership check is in
+flight. Only downstream fencing can make writes in that interval harmless.
 
-Each is a `CauseOfInterruption`, stored with the build and shown next to it. A line in the log is gone as
-soon as somebody looks at the build a week later.
+When Jenkins stops, the plugin abandons admissions without releasing them. Renewals cease and leases
+lapse; a quick restart can recover the same lease and token.
 
-#### A controller restart
+### Fencing token
 
-Everything the step keeps across a restart is a string. The live half -- the admission, its renewal
-timer, its watches -- cannot be serialised, and is not.
+Fencing is optional. The guarded work need not know about piplex.
 
-```mermaid
-flowchart TD
-    R(["onResume()"]) --> DROP["drop whatever was held:<br/>it was not renewed while the controller was down"]
-    DROP --> ASK["ask again, from scratch"]
-    ASK --> BODY{"was a body<br/>already running?"}
-    BODY -- no --> NORMAL["normal attempt:<br/>may park for handoverWait"]
-    BODY -- yes --> RESUME["handoverWait forced to 0"]
-    RESUME --> GOT{"admitted?"}
-    GOT -- yes --> KEEP["take ownership back and<br/>let Jenkins replay the body"]
-    GOT -- no --> ABORT(["ABORTED -- lost on resume"])
+Without it, a former holder may still write between losing its lease and being stopped, so the work
+should be idempotent. With it, the target remembers the highest token it has accepted and rejects
+lower ones.
+
+Inside an exclusive block, the token is available in two forms. `eod.sh` and `--fence` stand for
+your job and its own option:
+
+```groovy
+// Token captured when the body started. Goal: let the target reject a stale holder
+sh './eod.sh --fence "$PIPLEX_FENCING_TOKEN"'
+// Token read now. Effect: fails the step if ownership is gone
+writeFile file: 'fence.txt', text: "${piplexToken()}"
 ```
 
-Asking again is correct because asking is idempotent, the same reason the core compares state instead of
-counting events.
+`PIPLEX_FENCING_TOKEN` is expanded once when the body starts. `piplexToken()` checks the live
+admission and fails if ownership is gone. After restart the body is allowed to continue only when the
+retaken lease has the same token; a different token aborts it.
 
-**The body is the exception, and the one thing that must not be redone.** Jenkins wrote its program state
-down and replays it from where it stopped, so a resume that also started a body would run the guarded
-work twice on the same controller.
-
-What a resume owes a body already running is the ownership it is running under: retaken at once, or the
-body stopped. Never *waited for*. A run parked for a handover while its own work is under way is the very
-thing this step exists to prevent.
+Neither form protects anything unless the target resource rejects stale tokens.
 
 ### `piplexPublish`
 
 ```groovy
-post { success { piplexPublish key: 'data/euc1', generation: env.BUSINESS_DATE } }
+// Records that the date is produced. Goal: announce the result.
+// Effect: waiting consumers continue; builds with completedWhen for the date skip
+piplexPublish key: 'data/euc1',                // Milestone to raise
+              generation: params.BUSINESS_DATE // Generation just produced
 ```
 
-In `post { success { } }` and nowhere else. A milestone is a promise that the data is there. Publishing
-on the way out regardless of outcome turns every waiting pipeline into a consumer of half-written days.
-
-Returns the generation in force afterwards. Safe to re-run, and re-run automatically after a restart:
-publishing is idempotent and monotonic, so whether the write landed before the controller went down does
-not have to be known.
+Publish only after successful work. The step returns the generation in force. A restart repeats the
+write safely because milestone publication is monotonic and idempotent.
 
 ### `piplexAwait`
 
 ```groovy
-stage('Wait for EOD') {
-    steps { piplexAwait key: 'data/euc1', generation: env.BUSINESS_DATE, timeout: '90m' }
-}
+// Waits for the producer. Goal: start only after the date is produced.
+// Effect: holds no executor while waiting
+piplexAwait key: 'data/euc1',                 // Milestone to watch
+            generation: params.BUSINESS_DATE, // Date needed, or any later one
+            timeout: '90m',                   // Maximum wait
+            skipOnTimeout: false              // On timeout: false fails, true ends NOT_BUILT
 ```
 
-| Parameter | Default | |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `key` | required | the milestone |
-| `generation` | required | what this build needs |
-| `timeout` | `1h` | how long to wait |
-| `skipOnTimeout` | `false` | end `NOT_BUILT` instead of failing |
+| `key` | required | Milestone to read |
+| `generation` | required | Minimum generation needed |
+| `timeout` | `1h` | Maximum wait for this controller session |
+| `skipOnTimeout` | `false` | Return `NOT_BUILT` instead of `FAILURE` on timeout |
 
-Holds no executor while it waits, and survives a restart by looking again. The one thing a restart
-changes is that the timeout starts over.
+The wait holds no executor. A controller restart reads again but starts the timeout over. Stopping the
+build cancels the wait within its current one-minute round.
 
-Running out of time **fails the build** by default, and should: something that was supposed to arrive did
-not, and the alternative -- carrying on -- is how a day gets imported half-empty without anybody
-noticing.
+### Branching
 
-Set `skipOnTimeout: true` when not running is genuinely the right answer. The build then ends `NOT_BUILT`
-with what was actually there recorded on it.
+One `options` wrapper protects the whole pipeline DAG. If parallel branches protect independent
+resources, give each branch a distinct key and publish a milestone for each independently consumable
+result.
 
-### Branching pipelines
+Do not:
 
-The step guards a **body**, not a task. Where the block sits is exactly what it covers.
+- use the same exclusive key in parallel blocks of one build;
+- catch and swallow `FlowInterruptedException` or use `catchError(catchInterruptions: true)` around
+  guarded work;
+- assume Jenkins can stop a detached process started by the body.
 
-In `options { }` one lease covers the whole DAG -- every stage, sequential and parallel:
+### Install and build
 
-```groovy
-options { piplexExclusive(key: 'daily', designatedBy: 'daily', enabledBy: 'daily',
-                          generation: env.BUSINESS_DATE) }
-stages {
-    stage('Process') {
-        parallel {
-            stage('Trades')    { steps { sh './trades.sh' } }
-            stage('Positions') { steps { sh './positions.sh' } }
-        }
-    }
-    stage('Aggregate') { steps { sh './aggregate.sh' } }
-}
+Install `piplex-<version>.hpi` from a
+[release](https://github.com/green4j/piplex/releases), or build it with:
+
+```text
+./gradlew :piplex-jenkins:jpi
 ```
 
-One controller runs every branch; the others run none of them.
+The plugin is not distributed through an update centre.
 
-Losing that one lease -- designation moved, switched off, taken, or [renewal
-failed](02-exclusive-run.md#ownership-is-held-not-granted) past its grace -- cancels that one body.
-Every branch in flight is interrupted, nothing downstream starts, the build ends `ABORTED`:
-
-```
-Trades     ───────X
-Positions  ───────X   ownership lost
-Aggregate         ·   never starts
-```
-
-What those branches already did is not undone. Interruption stops work; it does not make
-half-finished work harmless.
-
-#### A key per branch
-
-When the branches own different things, guard them separately:
-
-```groovy
-parallel(
-    trades: {
-        piplexExclusive(key: 'processing/trades', designatedBy: 'processing/trades',
-                        enabledBy: 'processing/trades') {
-            sh './trades.sh'
-            piplexPublish key: 'data/trades', generation: env.BUSINESS_DATE
-        }
-    },
-    positions: { /* key: 'processing/positions', and so on */ }
-)
-```
-
-Now losing `processing/trades` stops the trades branch and nothing else, and its switch is its own.
-What a stopped branch does to the rest is Jenkins' `failFast`, not piplex's. A branch designated
-elsewhere does not run here at all: it runs in the other controller's copy of the build, which is
-how a night's work ends up split across controllers.
-
-**Two `piplexExclusive` blocks with the same key in one build is the mistake to avoid.** The lease
-is held by `ownerId/runId`, and the run id is the build itself -- so the second block is recognised
-as the same holder and let straight in, and whichever branch finishes first releases the lease out
-from under the other. Parallel branches need distinct keys.
-
-#### One milestone per result
-
-Publish what a consumer can actually use on its own, and let it wait for just that:
-
-```groovy
-parallel(
-    trades:    { piplexAwait key: 'data/trades',    generation: env.BUSINESS_DATE, timeout: '90m' },
-    positions: { piplexAwait key: 'data/positions', generation: env.BUSINESS_DATE, timeout: '90m' }
-)
-sh './aggregate.sh'
-```
-
-Where only the whole day is useful, publish one milestone instead, once every required branch has
-succeeded -- which is what `post { success { } }` means.
-
-| The work | The shape |
-|---|---|
-| one indivisible business operation | one block in `options` |
-| branches owning separate resources | a key, a switch and a milestone each |
-| a result only useful whole | one milestone, after all required branches |
-
-#### Two more things that bite
-
-`catchError(catchInterruptions: true)` around guarded work swallows the revocation and carries on
-without a lease. So does any `try`/`catch` of `FlowInterruptedException`.
-
-Cancelling reaches as far as Jenkins does. A service or background process the shell started
-outlives the branch that started it, and the step hands the pipeline no fencing token to stop it
-with -- which is why the work has to be idempotent. See
-[overlap](06-operations.md#overlap-is-still-possible).
-
-### Putting it together
-
-```groovy
-// One Jenkinsfile. The same job, with the same cron, on every controller.
-pipeline {
-    agent none
-    options {
-        piplexExclusive(key: 'eod',
-                        designatedBy: 'eod',
-                        enabledBy: 'eod',
-                        generation: env.BUSINESS_DATE,
-                        completedWhen: 'data/euc1',
-                        lease: '60s',
-                        handoverWait: '4h')
-    }
-    triggers { cron('H 2 * * *') }
-    stages {
-        stage('EOD') {
-            agent { kubernetes { } }
-            steps { sh './eod.sh' }
-        }
-    }
-    post {
-        success { piplexPublish key: 'data/euc1', generation: env.BUSINESS_DATE }
-    }
-}
-```
-
-```groovy
-// A consumer, anywhere.
-stage('Wait for EOD data') {
-    steps { piplexAwait key: 'data/euc1', generation: env.BUSINESS_DATE, timeout: '90m' }
-}
-```
-
-`BUSINESS_DATE` is yours to define -- a shared library, a build parameter, an environment variable.
-piplex does not set it.
-
-The cron goes on **every** controller and piplex decides, instead of the schedule being commented out of
-three controllers' configuration by hand.
-
-### Installing
-
-```
-./gradlew :piplex-jenkins:jpi      ->  piplex-jenkins/build/libs/piplex.hpi
-```
-
-Deploy the `.hpi` to each controller. It is not distributed through an update centre. The minimum
-supported controller is stamped in the manifest as `Jenkins-Version` and is currently **2.516.3**.
-
-The client and the discas nodes must be the **same version** as each other. See
-[operations](06-operations.md#version-skew), and [discas, ACLs and TLS](07-discas.md) for the cluster
-side.
-
----
-
-Previous: [4. Switches](04-switches.md) &middot; Next: [6. Operating piplex](06-operations.md)
+Previous: [4. Switches](04-switches.md) · Next: [6. Operations](06-operations.md) · [Documentation index](README.md)

@@ -35,6 +35,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class DrainSwitchExample {
 
     private static final String KEY = "new-day";
+    private static final String SWITCH = "new-day-switch";
 
     private DrainSwitchExample() {
     }
@@ -60,20 +61,23 @@ public final class DrainSwitchExample {
                 stopped.countDown();
             });
 
-            final Switch off = Examples.await(operator.switches().disable(KEY, "INC-4711, bad reference data"));
-            Examples.say("Operator switched " + KEY + " off: " + off.reason());
+            final Switch off = Examples.await(operator.switches().disable(SWITCH, "INC-4711, bad reference data"))
+                    .inForce();
+            Examples.say("Operator switched " + SWITCH + " off: " + off.reason());
 
             if (!stopped.await(10L, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("the run was never stopped");
+                throw new IllegalStateException("The run was never stopped");
             }
             Examples.say("Milan's run was stopped: " + why.get().reason()
                     + "; still holds it: " + running.isHeld());
+            // The work has stopped, so the lease can go back.
+            Examples.await(running.release());
 
             final Admission refused = Examples.await(milan.runs().begin(request("new-day#902")));
             Examples.say("The next build does not even start -> " + describe(refused));
 
-            Examples.await(operator.switches().enable(KEY));
-            Examples.say("Operator switched " + KEY + " back on");
+            Examples.await(operator.switches().enable(SWITCH));
+            Examples.say("Operator switched " + SWITCH + " back on");
 
             final Admission after = Examples.await(milan.runs().begin(request("new-day#903")));
             Examples.say("And the one after that              -> " + describe(after));
@@ -87,7 +91,7 @@ public final class DrainSwitchExample {
         return ExclusiveRequest.builder(KEY)
                 .ownedBy("eus1-blue")
                 .runId(runId)
-                .enabledBy(KEY)             // read the switch from piplex/enabled/new-day
+                .enabledBy(SWITCH)          // read the switch from piplex/enabled/new-day-switch
                 .lease(Duration.ofSeconds(4))
                 .build();
     }
