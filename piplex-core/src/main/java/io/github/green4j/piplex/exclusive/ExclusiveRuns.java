@@ -107,6 +107,11 @@ public final class ExclusiveRuns {
         return request.enabledBy() == null ? null : Switches.ownerKey(request.enabledBy(), request.ownerId());
     }
 
+    // External, so taken as is.
+    static String activeKey(final String key) {
+        return key;
+    }
+
     static String leaseKey(final String key) {
         return LEASE_PREFIX + key;
     }
@@ -192,8 +197,9 @@ public final class ExclusiveRuns {
         return read(request.designatedBy(), ExclusiveRuns::designationKey).thenCompose(designation ->
                 read(request.enabledBy(), ExclusiveRuns::switchKey).thenCompose(state ->
                         read(ownSwitch(request), ExclusiveRuns::switchKey).thenCompose(ownState ->
-                                read(request.completedWhen(), Milestones::keyOf).thenApply(milestone ->
-                                        new Guards(designation, state, ownState, milestone)))));
+                                read(request.activeKey(), ExclusiveRuns::activeKey).thenCompose(active ->
+                                        read(request.completedWhen(), Milestones::keyOf).thenApply(milestone ->
+                                                new Guards(designation, state, ownState, active, milestone))))));
     }
 
     private CompletionStage<Entry> read(final String key, final KeyMapper mapper) {
@@ -231,6 +237,12 @@ public final class ExclusiveRuns {
         if (ownOff != null) {
             return ownOff;
         }
+        if (request.activeKey() != null) {
+            final String value = guards.active().exists() ? guards.active().value() : null;
+            if (!request.activeValue().equals(value)) {
+                return new Admission.NotActive(request.activeKey(), value);
+            }
+        }
         if (request.designatedBy() == null) {
             return null;
         }
@@ -259,13 +271,13 @@ public final class ExclusiveRuns {
         return new Admission.Disabled(state.reason());
     }
 
-    // Only a designation somebody else holds is worth waiting on; the rest are answers.
+    // Only a designation or an active key somebody else holds is worth waiting on; the rest are answers.
     private CompletionStage<Admission> turnedAway(final ExclusiveRequest request,
                                                   final long deadlineNanos,
                                                   final Guards guards,
                                                   final Admission refused,
                                                   final Ask ask) {
-        if (refused instanceof Admission.NotDesignated) {
+        if (refused instanceof Admission.NotDesignated || refused instanceof Admission.NotActive) {
             return parkOrGiveUp(request, deadlineNanos, guards, refused, null, ask);
         }
         return CompletableFuture.completedFuture(refused);
@@ -449,7 +461,7 @@ public final class ExclusiveRuns {
             // Armed on the versions read with the lease in hand: a designation that moved since is a
             // key already past the version being watched from, so the watch answers rather than waits.
             admitted.start(guards.designation().version(), guards.switchEntry().version(),
-                    guards.ownSwitch().version());
+                    guards.ownSwitch().version(), guards.active().version());
         } catch (final RuntimeException thrown) {
             // The caller is about to be given the throw instead of the admission, and a lease whose
             // handle nobody holds is renewed until the controller stops. Given back first.
@@ -488,7 +500,7 @@ public final class ExclusiveRuns {
      * and the next round joins them rather than adding its own: see {@link StandingWatch}.
      *
      * <p>The keys that can end the wait are each a different answer to "is it my turn yet": the
-     * designation moved, the work was switched off -- everywhere or here -- or the milestone says
+     * designation or the active key moved, the work was switched off -- everywhere or here -- or the milestone says
      * somebody else has finished it.
      * The timer under them is the fourth, and it is how a freed lease gets noticed -- a lease is not a
      * key anybody can watch.
@@ -508,6 +520,7 @@ public final class ExclusiveRuns {
         watch(ask.designation, guards.designation(), endsAtNanos, woken);
         watch(ask.switchEntry, guards.switchEntry(), endsAtNanos, woken);
         watch(ask.ownSwitch, guards.ownSwitch(), endsAtNanos, woken);
+        watch(ask.active, guards.active(), endsAtNanos, woken);
         watch(ask.milestone, guards.milestone(), endsAtNanos, woken);
         final TimeSource.Cancellable floor = time.schedule(look, () -> woken.complete(null));
         woken.whenComplete((ignored, error) -> floor.cancel());
@@ -557,6 +570,8 @@ public final class ExclusiveRuns {
     private void report(final ExclusiveRequest request, final Admission giveUp) {
         if (giveUp instanceof Admission.NotDesignated notDesignated) {
             observer.notDesignated(refOf(request), notDesignated.currentOwner());
+        } else if (giveUp instanceof Admission.NotActive notActive) {
+            observer.notActive(refOf(request), notActive.key(), notActive.currentValue());
         } else if (giveUp instanceof Admission.HeldByOther held) {
             observer.heldByOther(refOf(request), held.heldBy());
         } else if (giveUp instanceof Admission.Contended) {
@@ -567,6 +582,9 @@ public final class ExclusiveRuns {
     private static String holderOf(final Admission giveUp) {
         if (giveUp instanceof Admission.NotDesignated notDesignated) {
             return notDesignated.currentOwner();
+        }
+        if (giveUp instanceof Admission.NotActive notActive) {
+            return notActive.currentValue();
         }
         if (giveUp instanceof Admission.HeldByOther held) {
             return held.heldBy();
@@ -617,6 +635,7 @@ public final class ExclusiveRuns {
         private final StandingWatch designation;
         private final StandingWatch switchEntry;
         private final StandingWatch ownSwitch;
+        private final StandingWatch active;
         private final StandingWatch milestone;
         // What the keys said at the last round, or null before the first. Guarded by this.
         private Guards seen;
@@ -627,6 +646,7 @@ public final class ExclusiveRuns {
             designation = standing(request.designatedBy(), ExclusiveRuns::designationKey);
             switchEntry = standing(request.enabledBy(), ExclusiveRuns::switchKey);
             ownSwitch = standing(ownSwitch(request), ExclusiveRuns::switchKey);
+            active = standing(request.activeKey(), ExclusiveRuns::activeKey);
             milestone = standing(request.completedWhen(), Milestones::keyOf);
         }
 
@@ -741,12 +761,13 @@ public final class ExclusiveRuns {
         String apply(String key);
     }
 
-    private record Guards(Entry designation, Entry switchEntry, Entry ownSwitch, Entry milestone) {
+    private record Guards(Entry designation, Entry switchEntry, Entry ownSwitch, Entry active, Entry milestone) {
 
         private boolean movedTo(final Guards now) {
             return !designation.version().equals(now.designation.version())
                     || !switchEntry.version().equals(now.switchEntry.version())
                     || !ownSwitch.version().equals(now.ownSwitch.version())
+                    || !active.version().equals(now.active.version())
                     || !milestone.version().equals(now.milestone.version());
         }
     }

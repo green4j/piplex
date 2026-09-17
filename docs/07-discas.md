@@ -111,6 +111,12 @@ acl.piplex-euc1-green = piplex/:GC
 
 It does not need `P`, `D` or `S`.
 
+An `activeWhenKey` lies outside `piplex/`, so grant `G` on it separately:
+
+```text
+acl.piplex-euc1-blue = piplex/:GC ; /dc/active:G
+```
+
 To separate operational writes from controllers, grant the keys listed in
 [Stored keys](01-model.md#stored-keys):
 
@@ -182,6 +188,7 @@ bound also covers a client deadline of up to 75 seconds.
 - Token with TLS and no client key store, or mTLS with no token.
 - Node identity verification enabled, or node certificates explicitly pinned.
 - ACL grants include `piplex/instances/` when narrowed by prefix.
+- ACL grants include `G` on every `activeWhenKey`.
 - Client and nodes run exactly the same discas version.
 - Certificate, membership and ACL reload is automated.
 - `/health`, `/ready` and `/metrics` are monitored.

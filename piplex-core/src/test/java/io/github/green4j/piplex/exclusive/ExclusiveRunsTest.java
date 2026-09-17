@@ -59,6 +59,7 @@ class ExclusiveRunsTest {
     private static final String GREEN = "eus1-blue";
     private static final Generation TODAY = Generation.of("2026-09-12");
     private static final Duration LEASE = Duration.ofSeconds(60);
+    private static final String ACTIVE = "/dc/active";
 
     private ManualTime time;
     private InMemoryCoordinationStore store;
@@ -124,6 +125,129 @@ class ExclusiveRunsTest {
 
         assertInstanceOf(Admitted.class, join(asked), "The next round reads in time");
         assertEquals(List.of("admitted"), told);
+    }
+
+    // ---- active: an external key names the site allowed to run ---------------------------------
+
+    @Test
+    void admitsARunWhileTheActiveKeyHoldsItsValue() {
+        put(ACTIVE, BLUE);
+
+        assertInstanceOf(Admitted.class, join(runs.begin(active(BLUE).build())));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"another value", "nothing", "removed"})
+    void turnsAwayARunWhileTheActiveKeyHoldsSomethingElse(final String held) {
+        final String value = switch (held) {
+            case "another value" -> {
+                put(ACTIVE, GREEN);
+                yield GREEN;
+            }
+            case "removed" -> {
+                put(ACTIVE, BLUE);
+                remove(ACTIVE);
+                yield null;
+            }
+            default -> null;
+        };
+        final List<String> told = new ArrayList<>();
+
+        final Admission refused = join(new ExclusiveRuns(store, time, new PiplexObserver() {
+            @Override
+            public void notActive(final RunRef run, final String key, final String currentValue) {
+                told.add(key + "=" + currentValue);
+            }
+        }).begin(active(BLUE).build()));
+
+        final Admission.NotActive notActive = assertInstanceOf(Admission.NotActive.class, refused);
+        assertEquals(ACTIVE, notActive.key());
+        assertEquals(value, notActive.currentValue());
+        assertEquals(List.of(ACTIVE + "=" + value), told);
+    }
+
+    @Test
+    void admitsAParkedRunOnceTheActiveKeyTakesItsValue() {
+        final CompletableFuture<Admission> parked = runs.begin(active(BLUE)
+                .handoverWait(Duration.ofHours(1))
+                .build()).toCompletableFuture();
+        assertFalse(parked.isDone(), "Nothing is active yet, so it waits");
+
+        put(ACTIVE, GREEN);
+        assertFalse(parked.isDone(), "Another site is active");
+
+        overwrite(ACTIVE, BLUE);
+
+        assertInstanceOf(Admitted.class, join(parked));
+    }
+
+    @Test
+    void doesNotAdmitARunWhoseActiveKeyMovedWhileItWasTakingTheLease() {
+        put(ACTIVE, BLUE);
+        final ExclusiveRuns racing =
+                new ExclusiveRuns(new RacedAcquireStore(store, () -> overwrite(ACTIVE, GREEN)), time);
+
+        final Admission refused = join(racing.begin(active(BLUE).build()));
+
+        assertEquals(GREEN, assertInstanceOf(Admission.NotActive.class, refused).currentValue());
+        assertInstanceOf(Admitted.class, join(runs.begin(active(GREEN).build())),
+                "The lease taken a moment before must be given back");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void revokesTheHolderAndHandsOverWhenTheActiveKeyMoves(final boolean removed) {
+        put(ACTIVE, BLUE);
+        final Admitted held = assertInstanceOf(Admitted.class, join(runs.begin(active(BLUE).build())));
+        final List<Revocation> seen = revocations(held);
+        final CompletableFuture<Admission> parked = runs.begin(active(GREEN)
+                .handoverWait(Duration.ofHours(4))
+                .build()).toCompletableFuture();
+
+        if (removed) {
+            remove(ACTIVE);
+        } else {
+            overwrite(ACTIVE, GREEN);
+        }
+
+        assertFalse(held.isHeld(), "The holder must stop once its site is no longer active");
+        assertEquals(1, seen.size());
+        assertEquals(Revocation.Reason.DEACTIVATED, seen.get(0).reason());
+        assertEquals(removed ? "'" + ACTIVE + "' was removed" : "'" + ACTIVE + "' is now '" + GREEN + "'",
+                seen.get(0).detail());
+        if (removed) {
+            parked.cancel(false);
+            return;
+        }
+        assertFalse(parked.isDone(), "Not while the revoked holder may still be running");
+
+        join(held.release());
+        time.advance(LEASE);
+
+        assertInstanceOf(Admitted.class, join(parked));
+    }
+
+    @ParameterizedTest
+    @MethodSource("activeOutages")
+    void givesTheRunUpWhenNothingCanBeLearntAboutTheActiveKeyForTooLong(final Outage outage) {
+        final UnreachableStore flaky = new UnreachableStore(store);
+        put(ACTIVE, BLUE);
+        final Admitted held = assertInstanceOf(Admitted.class,
+                join(new ExclusiveRuns(flaky, time).begin(active(BLUE)
+                        .guardGrace(Duration.ofSeconds(30))
+                        .build())));
+        final List<Revocation> seen = revocations(held);
+
+        outage.breaks().accept(flaky);
+        time.advance(Duration.ofSeconds(15));
+        time.advance(Duration.ofSeconds(25));
+        assertTrue(held.isHeld(), "A blink must not kill a run whose lease is being renewed");
+
+        time.advance(Duration.ofSeconds(10));
+
+        assertFalse(held.isHeld());
+        assertEquals(Revocation.Reason.GUARD_UNREACHABLE, seen.get(0).reason());
+        assertTrue(seen.get(0).detail().contains(ACTIVE), "Was: " + seen.get(0));
     }
 
     // ---- the work is already done ---------------------------------------------------------------
@@ -1044,6 +1168,12 @@ class ExclusiveRunsTest {
         assertFalse(second.isDone(), "And the second caller must not be told it has");
     }
 
+    static List<Outage> activeOutages() {
+        return List.of(
+                new Outage("Reads fail", store -> store.stopAnsweringReadsOf(ACTIVE)),
+                new Outage("Nothing is answered", store -> store.goSilentOn(ACTIVE)));
+    }
+
     static List<Outage> guardOutages() {
         final String designation = Designations.keyOf(KEY);
         return List.of(
@@ -1478,6 +1608,10 @@ class ExclusiveRunsTest {
 
     private ExclusiveRequest.Builder completing(final String owner) {
         return elected(owner).generation(TODAY).completedWhen("data/euc1");
+    }
+
+    private ExclusiveRequest.Builder active(final String owner) {
+        return elected(owner).activeWhen(ACTIVE, owner);
     }
 
     private ExclusiveRequest.Builder designated(final String owner) {

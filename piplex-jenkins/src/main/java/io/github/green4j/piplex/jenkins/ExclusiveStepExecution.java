@@ -98,6 +98,8 @@ final class ExclusiveStepExecution extends StepExecution {
     private final String generation;
     private final String completedWhen;
     private final String enabledBy;
+    private final String activeWhenKey;
+    private final String activeWhenValue;
     private final String lease;
     private final String renewEvery;
     private final String renewalGrace;
@@ -186,6 +188,8 @@ final class ExclusiveStepExecution extends StepExecution {
         this.generation = step.getGeneration();
         this.completedWhen = step.getCompletedWhen();
         this.enabledBy = step.getEnabledBy();
+        this.activeWhenKey = step.getActiveWhenKey();
+        this.activeWhenValue = step.getActiveWhenValue();
         this.lease = step.getLease();
         this.renewEvery = step.getRenewEvery();
         this.renewalGrace = step.getRenewalGrace();
@@ -374,6 +378,12 @@ final class ExclusiveStepExecution extends StepExecution {
                 .handoverWait(resuming
                         ? Duration.ZERO
                         : notWaitedYet(Durations.parse(handoverWait, Duration.ZERO, "handoverWait")));
+        if (activeWhenKey != null && !activeWhenKey.isBlank()) {
+            // One Jenkinsfile for every site: each controller waits for its own name by default.
+            builder.activeWhen(activeWhenKey.trim(), activeWhenValue == null || activeWhenValue.isBlank()
+                    ? ownerId
+                    : activeWhenValue.trim());
+        }
         if (generation != null && !generation.isBlank()) {
             builder.generation(Generation.of(generation.trim()));
         }

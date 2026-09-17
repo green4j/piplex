@@ -111,6 +111,8 @@ class StateFixturesTest {
         assertEquals("2026-09-12", field(asking, "generation"));
         assertEquals("eod", field(asking, "completedWhen"));
         assertEquals("eod", field(asking, "enabledBy"));
+        assertEquals("/dc/active", field(asking, "activeWhenKey"));
+        assertEquals("euc1-blue", field(asking, "activeWhenValue"));
         assertEquals("60s", field(asking, "lease"));
         assertEquals("10s", field(asking, "renewEvery"));
         assertEquals("30s", field(asking, "renewalGrace"));
@@ -187,6 +189,8 @@ class StateFixturesTest {
         set(execution, "generation", "2026-09-12");
         set(execution, "completedWhen", "eod");
         set(execution, "enabledBy", "eod");
+        set(execution, "activeWhenKey", "/dc/active");
+        set(execution, "activeWhenValue", "euc1-blue");
         set(execution, "lease", "60s");
         set(execution, "renewEvery", "10s");
         set(execution, "renewalGrace", "30s");

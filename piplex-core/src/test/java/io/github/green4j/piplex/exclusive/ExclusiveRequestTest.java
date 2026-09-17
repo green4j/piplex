@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.exclusive;
 
+import io.github.green4j.piplex.Generation;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -57,6 +58,27 @@ class ExclusiveRequestTest {
                 new Typed("guardGrace", b -> b.guardGrace(Duration.ZERO)),
                 new Typed("lease", b -> b.lease(Duration.ZERO)),
                 new Typed("renewEvery", b -> b.renewEvery(Duration.ofMinutes(5))));
+    }
+
+    @Test
+    void refusesAnActiveKeyItCouldNotConsult() {
+        assertThrows(IllegalArgumentException.class, () -> builder().activeWhen("/dc/active", null).build());
+        assertThrows(IllegalArgumentException.class, () -> builder().activeWhen(null, "euc1-blue").build());
+        assertThrows(IllegalArgumentException.class, () -> builder().activeWhen(" ", "euc1-blue").build());
+        assertThrows(IllegalArgumentException.class, () -> builder().activeWhen("/dc/active", " ").build());
+        // Piplex's own records: a lease or a designation read as a site name.
+        assertThrows(IllegalArgumentException.class,
+                () -> builder().activeWhen("piplex/exclusive/eod", "euc1-blue").build());
+        builder().activeWhen("/dc/active", "euc1-blue").build();
+    }
+
+    @Test
+    void refusesTwoAnswersToWhoRuns() {
+        // Designated blue, active green: nobody would run, and nothing would say why.
+        assertThrows(IllegalArgumentException.class, () -> builder().designatedBy("eod-owner")
+                .activeWhen("/dc/active", "euc1-blue").build());
+        builder().enabledBy("eod").completedWhen("eod").generation(Generation.of("2026-09-12"))
+                .activeWhen("/dc/active", "euc1-blue").build();
     }
 
     @ParameterizedTest

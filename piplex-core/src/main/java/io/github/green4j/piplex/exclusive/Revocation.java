@@ -35,6 +35,12 @@ public record Revocation(Reason reason, String newOwner, String detail) {
         DESIGNATION_CHANGED,
 
         /**
+         * The external active key no longer holds the value this run needs. Planned, like
+         * {@link #DESIGNATION_CHANGED}; {@link Revocation#detail()} says what it holds now.
+         */
+        DEACTIVATED,
+
+        /**
          * The store said the lease is no longer this run's: it lapsed, or somebody else took it.
          *
          * <p>Evidence, and that is what separates it from {@link #RENEWAL_FAILED}. Something was heard

@@ -4,6 +4,8 @@ io.github.green4j.piplex.jenkins.ExclusiveStepExecution
     bodyEnded Z
     stateVersion I
     waitedNanos J
+    activeWhenKey Ljava/lang/String;
+    activeWhenValue Ljava/lang/String;
     body Lorg/jenkinsci/plugins/workflow/steps/BodyExecution;
     bodyFailure Ljava/lang/Throwable;
     completedWhen Ljava/lang/String;

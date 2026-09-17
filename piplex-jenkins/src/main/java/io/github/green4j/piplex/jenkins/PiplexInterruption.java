@@ -122,6 +122,11 @@ final class PiplexInterruption {
                     ? "nobody is designated to run it yet"
                     : "'" + notDesignated.currentOwner() + "' is designated to run it";
         }
+        if (admission instanceof Admission.NotActive notActive) {
+            return notActive.currentValue() == null
+                    ? "'" + notActive.key() + "' holds nothing yet"
+                    : "'" + notActive.key() + "' is '" + notActive.currentValue() + "'";
+        }
         if (admission instanceof Admission.HeldByOther held) {
             return "'" + held.heldBy() + "' is running it";
         }

@@ -18,7 +18,8 @@ import io.github.green4j.piplex.Generation;
  */
 public sealed interface Admission
         permits Admitted, Admission.NotDesignated, Admission.HeldByOther, Admission.Contended,
-                Admission.AlreadyCompleted, Admission.Disabled, Admission.GuardUnreadable {
+                Admission.AlreadyCompleted, Admission.Disabled, Admission.GuardUnreadable,
+                Admission.NotActive {
 
     /**
      * Somebody else is the designated owner. Normal on every controller but one, and not a failure.
@@ -73,5 +74,15 @@ public sealed interface Admission
      * @param detail what is wrong with it
      */
     record GuardUnreadable(String key, String detail) implements Admission {
+    }
+
+    /**
+     * The external active key does not hold the value this run needs. Normal while another site is
+     * active, and waited on like a designation.
+     *
+     * @param key          the key consulted
+     * @param currentValue what it holds, or {@code null} when it holds nothing
+     */
+    record NotActive(String key, String currentValue) implements Admission {
     }
 }

@@ -120,7 +120,10 @@ final class HeldAdmission implements Admitted {
         return remaining == null || remaining.compareTo(lease) > 0 ? lease : remaining;
     }
 
-    void start(final String designationVersion, final String switchVersion, final String ownSwitchVersion) {
+    void start(final String designationVersion,
+               final String switchVersion,
+               final String ownSwitchVersion,
+               final String activeVersion) {
         armGiveUp(lastRenewedNanos, leaseValidUntilNanos);
         scheduleRenew();
         if (request.designatedBy() != null) {
@@ -132,6 +135,10 @@ final class HeldAdmission implements Admitted {
                     this::switchSays)).begin(switchVersion);
             guard(new Guard(ExclusiveRuns.switchKey(ExclusiveRuns.ownSwitch(request)), "switch",
                     this::switchSays)).begin(ownSwitchVersion);
+        }
+        if (request.activeKey() != null) {
+            guard(new Guard(ExclusiveRuns.activeKey(request.activeKey()), "active key",
+                    this::activeSays)).begin(activeVersion);
         }
     }
 
@@ -630,6 +637,24 @@ final class HeldAdmission implements Admitted {
         }
         if (!seen.owner().equals(request.ownerId())) {
             return new Revocation(Revocation.Reason.DESIGNATION_CHANGED, seen.owner());
+        }
+        return null;
+    }
+
+    /**
+     * What the external active key says about this run, now. State only, as for the designation.
+     *
+     * @param key   the key it was read from
+     * @param entry what it says
+     * @return why this run may not continue, or {@code null} while it may
+     */
+    private Revocation activeSays(final String key, final Entry entry) {
+        if (!entry.exists()) {
+            return new Revocation(Revocation.Reason.DEACTIVATED, null, "'" + key + "' was removed");
+        }
+        if (!entry.value().equals(request.activeValue())) {
+            return new Revocation(Revocation.Reason.DEACTIVATED, null,
+                    "'" + key + "' is now '" + entry.value() + "'");
         }
         return null;
     }

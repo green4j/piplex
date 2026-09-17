@@ -37,6 +37,10 @@ import java.util.Objects;
  *                     afterwards leaves a gap in which the next candidate is admitted to redo the
  *                     generation, which is the one thing this field is there to prevent
  * @param enabledBy    the key holding the on/off switch, or {@code null} to not consult one
+ * @param activeKey    an external store key, taken as is, whose value must equal {@code activeValue}
+ *                     for the run to proceed; {@code null} to not consult one. Piplex only reads it.
+ *                     Not combined with {@code designatedBy}: both name who runs
+ * @param activeValue  the value {@code activeKey} must hold; set together with it
  * @param lease        how long the lease lasts unless renewed; it bounds how long a handover takes in
  *                     the bad case, so it is short, and has nothing to do with how long the work runs
  * @param renewEvery   how often to renew
@@ -57,6 +61,8 @@ public record ExclusiveRequest(String key,
                                Generation generation,
                                String completedWhen,
                                String enabledBy,
+                               String activeKey,
+                               String activeValue,
                                Duration lease,
                                Duration renewEvery,
                                Duration renewalGrace,
@@ -65,6 +71,9 @@ public record ExclusiveRequest(String key,
 
     /** The default lease: short, because it is the handover bound and not the work's duration. */
     public static final Duration DEFAULT_LEASE = Duration.ofSeconds(60);
+
+    // Where piplex keeps its own records; an active key there would collide with one of them.
+    private static final String OWN_PREFIX = "piplex/";
 
     /**
      * Validates the request.
@@ -106,6 +115,25 @@ public record ExclusiveRequest(String key,
             throw new IllegalArgumentException(
                     "The enabledBy switch must not have a segment starting with '@', but got '" + enabledBy + "'");
         }
+        if ((activeKey == null) != (activeValue == null)) {
+            throw new IllegalArgumentException("activeKey and activeValue must be set together");
+        }
+        if (activeKey != null) {
+            // Two answers to who runs: when they disagree, nobody does.
+            if (designatedBy != null) {
+                throw new IllegalArgumentException("designatedBy and activeKey must not be combined");
+            }
+            if (activeKey.isBlank()) {
+                throw new IllegalArgumentException("activeKey must not be blank");
+            }
+            if (activeKey.startsWith(OWN_PREFIX)) {
+                throw new IllegalArgumentException(
+                        "activeKey must not be under '" + OWN_PREFIX + "', but got '" + activeKey + "'");
+            }
+            if (activeValue.isBlank()) {
+                throw new IllegalArgumentException("activeValue must not be blank");
+            }
+        }
         if (completedWhen != null && generation == null) {
             throw new IllegalArgumentException("completedWhen needs a generation to compare against");
         }
@@ -132,6 +160,8 @@ public record ExclusiveRequest(String key,
         private Generation generation;
         private String completedWhen;
         private String enabledBy;
+        private String activeKey;
+        private String activeValue;
         private Duration lease = DEFAULT_LEASE;
         private Duration renewEvery;
         private Duration renewalGrace;
@@ -207,6 +237,17 @@ public record ExclusiveRequest(String key,
         }
 
         /**
+         * @param key   the external key to consult, taken as is
+         * @param value what it must hold for the run to proceed
+         * @return this
+         */
+        public Builder activeWhen(final String key, final String value) {
+            this.activeKey = key;
+            this.activeValue = value;
+            return this;
+        }
+
+        /**
          * @param value how long the lease lasts unless renewed
          * @return this
          */
@@ -266,7 +307,7 @@ public record ExclusiveRequest(String key,
             // go on with nothing being learnt about what permits it.
             final Duration guard = guardGrace != null ? guardGrace : grace;
             return new ExclusiveRequest(key, ownerId, runId, executionId, designatedBy, generation,
-                    completedWhen, enabledBy, lease, every, grace, guard, handoverWait);
+                    completedWhen, enabledBy, activeKey, activeValue, lease, every, grace, guard, handoverWait);
         }
     }
 }

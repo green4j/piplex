@@ -88,6 +88,12 @@ options {
                     generation: params.BUSINESS_DATE
 }
 
+// Active site. Goal: follow external failover tooling.
+// Effect: runs only while /dc/active holds this controller's ownerId
+piplexExclusive(key: 'eod', activeWhenKey: '/dc/active') {
+    sh './eod.sh'
+}
+
 // Block. Goal: guard only the enclosed steps.
 // Effect: without designatedBy, the first controller to take the lease runs
 piplexExclusive(key: 'eod') {
@@ -106,6 +112,8 @@ a wrapper.
 | `generation` | unset | Work generation |
 | `completedWhen` | unset | Milestone that makes the generation unnecessary |
 | `enabledBy` | unset | Shared and per-owner switches to consult |
+| `activeWhenKey` | unset | External key that must hold `activeWhenValue`; not with `designatedBy` |
+| `activeWhenValue` | `ownerId` | Value that admits this controller |
 | `lease` | `60s` | Lease term and failed-holder handover bound |
 | `renewEvery` | `lease / 3` | Renewal interval |
 | `renewalGrace` | `lease` | Silence tolerated from lease operations |
@@ -128,7 +136,7 @@ A failed or timed-out release is not a build failure; the lease is left to lapse
 
 | Situation | Build result |
 |---|---|
-| Not designated, lease held elsewhere, contention, already complete or disabled | `NOT_BUILT` |
+| Not designated, not active, lease held elsewhere, contention, already complete or disabled | `NOT_BUILT` |
 | Guard record cannot be parsed or initial store call fails | `FAILURE` |
 | Ownership is revoked after work starts | `ABORTED` |
 | Ownership cannot be retaken on resume | `ABORTED` |

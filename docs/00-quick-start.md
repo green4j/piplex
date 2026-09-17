@@ -1,13 +1,14 @@
 ## Quick start
 
-This guide runs one nightly job on two Jenkins controllers. One controller is designated, the other
-waits to take over, and a consumer waits for the producer's milestone.
+This guide runs one nightly job on two Jenkins controllers. Failover tooling marks one controller
+active, the other waits to take over, and a consumer waits for the producer's milestone.
 
 You need:
 
 - two Jenkins controllers, version 2.555.1 or later, running Java 21;
 - one three-node discas cluster reachable from both controllers;
-- the same pipeline available on both controllers.
+- the same pipeline available on both controllers;
+- failover tooling, or any discas client, that can write a plain key.
 
 For production TLS, authentication and ACLs, use [the security guide](07-discas.md) before going live.
 
@@ -53,25 +54,19 @@ For this first run, the cluster may use its trusted-environment profile. In prod
 controller its own authenticated client id and configure TLS as described in
 [discas and security](07-discas.md).
 
-### 3. Name the initial owner
+### 3. Mark the active controller
 
-On either controller, open **Manage Jenkins > Script Console**:
+Have the failover tooling write a plain value, not JSON:
 
-```groovy
-import hudson.model.TaskListener
-import io.github.green4j.piplex.jenkins.PiplexConfiguration
-
-def piplex = PiplexConfiguration.get().piplexFor(TaskListener.NULL)
-piplex.designations()
-      .designate('eod-owner', 'euc1-blue', 'initial owner')
-      .toCompletableFuture().join()
+```text
+/dc/active = euc1-blue
 ```
 
-The designation is shared state and survives controller restarts.
+Piplex only reads this key; grant controllers `G` on it (see [ACLs](07-discas.md#acls)).
 
 ### 4. Create the job on both controllers
 
-Use the same Jenkinsfile on each controller:
+Use the same Jenkinsfile on each controller; only `activeWhenValue` differs (`euc1-green` on green):
 
 ```groovy
 pipeline {
@@ -88,9 +83,11 @@ pipeline {
             // Name of the protected work. Goal: never run it twice at once.
             // Effect: a second build on any controller parks or ends NOT_BUILT
             key: 'eod',
-            // Designation that names the controller to run. Goal: choose where the work runs.
-            // Effect: other controllers park or skip; redesignating aborts the running build
-            designatedBy: 'eod-owner',
+            // Key written by the failover tooling. Goal: run where the tooling says.
+            // Effect: other controllers park or skip; a new value aborts the running build
+            activeWhenKey: '/dc/active',
+            // Value that admits this controller
+            activeWhenValue: 'euc1-blue',
             // Operational switch. Goal: stop the work without editing jobs.
             // Effect: disable('eod-switch') aborts running builds and skips new ones
             enabledBy: 'eod-switch',
@@ -103,8 +100,8 @@ pipeline {
             // Ownership term, renewed while the build runs. Goal: survive a crashed controller.
             // Effect: a standby takes over at most this long after the holder dies
             lease: '60s',
-            // Time a build that cannot run yet waits without an executor. Goal: take over
-            // without waiting for the next cron. Effect: after a handover it starts at once
+            // Time an inactive build waits without an executor. Goal: if failover switches
+            // /dc/active here, run tonight, not at the next cron. Ends early once the milestone is published
             handoverWait: '4h'
         )
     }
@@ -149,22 +146,25 @@ At trigger time:
 
 ### 5. Exercise a handover
 
-While blue is running or green is parked:
+While blue is running or green is parked, have the tooling write:
 
-```groovy
-piplex.designations()
-      .designate('eod-owner', 'euc1-green', 'handover test')
-      .toCompletableFuture().join()
+```text
+/dc/active = euc1-green
 ```
 
-Blue is revoked and Jenkins cancels its guarded body. Green wakes, waits for the lease to be released
-or lapse, then takes over. Without a parked candidate, the next scheduled green build runs.
+Blue is revoked with `DEACTIVATED` and Jenkins cancels its guarded body. Green wakes, waits for the
+lease to be released or lapse, then takes over. Without a parked candidate, the next scheduled green
+build runs.
 
 ### 6. Exercise a drain
 
-Disable the work everywhere:
+On either controller, open **Manage Jenkins > Script Console** and disable the work everywhere:
 
 ```groovy
+import hudson.model.TaskListener
+import io.github.green4j.piplex.jenkins.PiplexConfiguration
+
+def piplex = PiplexConfiguration.get().piplexFor(TaskListener.NULL)
 piplex.switches().disable('eod-switch', 'maintenance test').toCompletableFuture().join()
 ```
 
@@ -182,7 +182,20 @@ piplex.switches()
       .toCompletableFuture().join()
 ```
 
-### 7. Add a consumer
+### 7. Choose the owner inside piplex
+
+Without failover tooling, replace `activeWhenKey` and `activeWhenValue` with
+`designatedBy: 'eod-owner'` and name the owner from the Script Console:
+
+```groovy
+piplex.designations()
+      .designate('eod-owner', 'euc1-blue', 'initial owner')
+      .toCompletableFuture().join()
+```
+
+Designating `euc1-green` later hands the work over the same way. The two cannot be combined.
+
+### 8. Add a consumer
 
 Any pipeline on any controller can wait for the producer:
 

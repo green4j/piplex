@@ -43,6 +43,7 @@ different keys, even when the names are equal. Examples use the quick start name
 | `designatedBy` | `piplex/designated/<designatedBy>` | `piplex/designated/eod-owner` | Runs; watched while parked or admitted | Operator: `designate`, `repair` |
 | `enabledBy` | `piplex/enabled/<enabledBy>` | `piplex/enabled/eod-switch` | Runs; watched while parked or admitted | Operator: `disable`, `enable`, `repair` |
 | `enabledBy` plus the controller's `ownerId` | `piplex/enabled/<enabledBy>/@<ownerId>` | `piplex/enabled/eod-switch/@euc1-blue` | Runs of that owner; watched while parked or admitted | Operator: `disable('eod-switch/@euc1-blue', ...)` |
+| `activeKey` / `activeWhenKey` | `<activeKey>`, as is | `/dc/active` | Runs; watched while parked or admitted | External system only |
 | `completedWhen` | `piplex/milestone/<completedWhen>` | `piplex/milestone/data/euc1` | Runs; watched while parked | Producer, see the next row |
 | `key` of `piplexPublish` / `publish` | `piplex/milestone/<key>` | `piplex/milestone/data/euc1` | Producer, before its compare-and-set | Producer; operator `repair` |
 | `key` of `piplexAwait` / `awaitAtLeast` | `piplex/milestone/<key>` | `piplex/milestone/data/euc1` | Consumer, watched | Producer, see the previous row |
@@ -54,6 +55,9 @@ Other properties are not keys:
 - `ownerId`, `runId` and `executionId` name the lease holder; the lease record keeps that name, the
   fencing token and the `lease` term;
 - `renewEvery`, `renewalGrace`, `guardGrace`, `handoverWait` and `timeout` are local timings.
+
+The active key is the only key outside `piplex/`. Its value is a plain string, not JSON, and piplex
+never writes it.
 
 `piplex/instances/` is not work state, but its prefix must be included in Jenkins ACLs.
 

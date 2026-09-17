@@ -15,6 +15,8 @@ If there is one controller and no cross-controller dependency, piplex is unneces
 - **Milestones** publish the generation a producer completed. Publishing is monotonic and idempotent;
   waiting compares current state, so it survives missed changes and restarts.
 - **Switches** enable, disable or drain work through shared state instead of a configuration deploy.
+- **Active keys** follow a value another system writes, such as the active data centre: work runs
+  only where the value matches and moves when it changes.
 
 ### Safety boundary
 
@@ -36,9 +38,11 @@ pipeline {
             // Name of the protected work. Goal: never run it twice at once.
             // Effect: a second build on any controller parks or ends NOT_BUILT
             key: 'eod',
-            // Designation that names the controller to run. Goal: choose where the work runs.
-            // Effect: other controllers park or skip; redesignating aborts the running build
-            designatedBy: 'eod-owner',
+            // Key the failover tooling writes, e.g. /dc/active = euc1-blue. Goal: run on the
+            // active controller. Effect: others park or skip; a new value aborts the running build
+            activeWhenKey: '/dc/active',
+            // Value that admits this controller; each controller sets its own
+            activeWhenValue: 'euc1-blue',
             // Operational switch. Goal: stop the work without editing jobs.
             // Effect: disable('eod-switch') aborts running builds and skips new ones
             enabledBy: 'eod-switch',
@@ -48,8 +52,8 @@ pipeline {
             // Milestone the producer publishes. Goal: never redo a finished date.
             // Effect: the build ends NOT_BUILT if the milestone has this date or later
             completedWhen: 'data/euc1',
-            // Time a build that cannot run yet waits without an executor. Goal: take over
-            // without waiting for the next cron. Effect: after a handover it starts at once
+            // Time an inactive build waits without an executor. Goal: if failover switches
+            // /dc/active here, run tonight, not at the next cron. Ends early once the milestone is published
             handoverWait: '4h'
         )
     }
@@ -72,9 +76,10 @@ pipeline {
 }
 ```
 
-Put the same job and cron on every controller. `ownerId` is configured once per controller;
-`BUSINESS_DATE` is supplied by the pipeline. The declarative `options` wrapper includes `post`, so
-the milestone is published before the lease is released.
+Put the same job and cron on every controller, differing only in `activeWhenValue`. `BUSINESS_DATE`
+is supplied by the pipeline. To choose the owner inside piplex instead, replace both active-key
+parameters with `designatedBy`. The declarative `options` wrapper includes `post`, so the milestone
+is published before the lease is released.
 
 Consumers wait without occupying an executor:
 

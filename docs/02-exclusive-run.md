@@ -7,6 +7,8 @@ for the life of the work.
 
 - **Elected:** leave `designatedBy` unset. Any candidate may take the lease.
 - **Designated:** set `designatedBy`. Only the owner named by that designation may take the lease.
+- **Active key:** set `activeWhen(key, value)`. Only a run whose value the external key holds may
+  take the lease. It replaces `designatedBy`; setting both is rejected.
 
 Designation answers who should run; the lease prevents two runs by that owner from entering together.
 
@@ -35,6 +37,7 @@ while the lease was being acquired.
 |---|---|
 | `Admitted` | The run currently holds the lease and guards |
 | `NotDesignated` | Another owner, or nobody, is designated |
+| `NotActive` | The active key is absent or holds another value |
 | `HeldByOther` | Another execution holds the lease |
 | `Contended` | Nobody is known to hold it, but this acquire lost a write race |
 | `AlreadyCompleted` | `completedWhen` has reached the requested generation |
@@ -60,6 +63,7 @@ Revocation reasons distinguish operational changes from faults:
 | Reason | Meaning |
 |---|---|
 | `DESIGNATION_CHANGED` | Another owner, or nobody, is now designated |
+| `DEACTIVATED` | The active key was removed or now holds another value |
 | `DISABLED` | A switch was turned off |
 | `LEASE_LOST` | The store answered that the lease no longer belongs to this run |
 | `RENEWAL_FAILED` | A renewal outcome could not be learned before the safe deadline |
@@ -72,12 +76,13 @@ independently. Neither extends ownership past the current lease term. See
 
 ### Parking and handover
 
-A candidate that is not designated, or finds the lease occupied, may wait for `handoverWait`.
+A candidate that is not designated or not active, or finds the lease occupied, may wait for `handoverWait`.
 Parking holds no thread or executor. Each bounded round watches:
 
 - `piplex/designated/<designatedBy>`;
 - `piplex/enabled/<enabledBy>`;
 - `piplex/enabled/<enabledBy>/@<ownerId>`;
+- `<activeKey>`;
 - `piplex/milestone/<completedWhen>`;
 - plus a timer, because the lease itself has no watch.
 
@@ -99,6 +104,7 @@ acquires. If the old process disappears, takeover waits at most for its lease to
 | `generation` | `null` | Work generation |
 | `completedWhen` | `null` | Milestone that makes this generation unnecessary |
 | `enabledBy` | `null` | Shared switch; also enables the per-owner switch |
+| `activeKey`, `activeValue` | `null` | External key and the exact value it must hold; set together |
 | `lease` | 60 s | Lease term and worst-case handover bound |
 | `renewEvery` | `lease / 3` | Normal renewal interval |
 | `renewalGrace` | `lease` | Maximum silence tolerated from lease operations |
@@ -110,6 +116,23 @@ acquires. If the old process disappears, takeover waits at most for its lease to
 
 The lease identity is `ownerId/runId[/executionId]`. A retry after an unknown acquire outcome must use
 the same identity; genuinely concurrent asks must use distinct `executionId` values.
+
+### Active keys
+
+An active key is written by another system, such as failover tooling:
+
+```java
+ExclusiveRequest.builder("eod")
+        .ownedBy("euc1-blue")
+        .runId("eod#142")
+        .activeWhen("/dc/active", "euc1-blue")
+        .handoverWait(Duration.ofHours(4))
+        .build();
+```
+
+The value is compared exactly and an absent key never matches. The key is used as is and must not
+start with `piplex/`. Switches and `completedWhen` combine with it. Any string is readable, so this guard never reports `GuardUnreadable`; an
+unreachable key still ends the run after `guardGrace`.
 
 ### Completion ordering
 

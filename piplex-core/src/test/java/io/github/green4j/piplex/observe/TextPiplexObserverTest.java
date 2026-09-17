@@ -61,6 +61,17 @@ class TextPiplexObserverTest {
                 + "reason=LEASE_LOST", lines.get(0));
     }
 
+    @Test
+    void keepsTheActiveKeyApartFromTheCorrelationKey() {
+        observer.notActive(RUN, "/dc/active", "euc2-blue");
+        observer.notActive(RUN, "/dc/active", null);
+
+        assertEquals("NOT_ACTIVE key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
+                + "activeKey=/dc/active currentValue=euc2-blue", lines.get(0));
+        assertEquals("NOT_ACTIVE key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
+                + "activeKey=/dc/active", lines.get(1));
+    }
+
     static List<Arguments> reasons() {
         return List.of(
                 arguments("INC-4471 migrating the cluster", "\"INC-4471 migrating the cluster\""),

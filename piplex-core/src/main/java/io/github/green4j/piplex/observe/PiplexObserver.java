@@ -44,6 +44,16 @@ public interface PiplexObserver {
     }
 
     /**
+     * The external active key does not hold the value this run needs.
+     *
+     * @param run          which run
+     * @param key          the key consulted
+     * @param currentValue what it holds, or {@code null} when it holds nothing
+     */
+    default void notActive(RunRef run, String key, String currentValue) {
+    }
+
+    /**
      * A run is already under way.
      *
      * @param run    which run asked

@@ -33,6 +33,8 @@ public final class PiplexExclusiveStep extends Step {
     private String generation;
     private String completedWhen;
     private String enabledBy;
+    private String activeWhenKey;
+    private String activeWhenValue;
     private String lease;
     private String renewEvery;
     private String renewalGrace;
@@ -97,6 +99,31 @@ public final class PiplexExclusiveStep extends Step {
     @DataBoundSetter
     public void setEnabledBy(final String value) {
         this.enabledBy = value;
+    }
+
+    public String getActiveWhenKey() {
+        return activeWhenKey;
+    }
+
+    /**
+     * @param value an external key, taken as is, which must hold {@code activeWhenValue} for the body
+     *              to run, and whose change stops it
+     */
+    @DataBoundSetter
+    public void setActiveWhenKey(final String value) {
+        this.activeWhenKey = value;
+    }
+
+    public String getActiveWhenValue() {
+        return activeWhenValue;
+    }
+
+    /**
+     * @param value what {@code activeWhenKey} must hold; this controller's owner id when unset
+     */
+    @DataBoundSetter
+    public void setActiveWhenValue(final String value) {
+        this.activeWhenValue = value;
     }
 
     public String getLease() {

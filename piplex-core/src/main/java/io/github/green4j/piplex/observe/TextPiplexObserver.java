@@ -49,6 +49,11 @@ public final class TextPiplexObserver implements PiplexObserver {
     }
 
     @Override
+    public void notActive(final RunRef run, final String key, final String currentValue) {
+        emit(line("NOT_ACTIVE", run).put("activeKey", key).put("currentValue", currentValue));
+    }
+
+    @Override
     public void heldByOther(final RunRef run, final String heldBy) {
         emit(line("HELD_BY_OTHER", run).put("heldBy", heldBy));
     }

@@ -66,6 +66,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @WithJenkins
 class PiplexStepsTest {
 
+    private static final String ACTIVE = "/dc/active";
+
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private final TimeSource time = TimeSource.of(scheduler);
     private InMemoryCoordinationStore store;
@@ -309,6 +311,49 @@ class PiplexStepsTest {
         jenkins.waitForCompletion(run);
         jenkins.assertBuildStatus(Result.ABORTED, run);
         jenkins.assertLogContains("patching euc1-blue", run);
+    }
+
+    @Test
+    void runsTheBodyWhereTheActiveKeyNamesThisControllerAndStopsItWhenTheKeyMoves(final JenkinsRule jenkins)
+            throws Exception {
+        configure("euc1-blue");
+        activate("euc1-blue");
+
+        final WorkflowJob job = jenkins.createProject(WorkflowJob.class, "eod-active");
+        // No value: this controller's own owner id is what the key has to hold.
+        job.setDefinition(new CpsFlowDefinition("""
+                node {
+                    piplexExclusive(key: 'eod', activeWhenKey: '/dc/active', lease: '5s') {
+                        echo 'working'
+                        sleep 120
+                    }
+                }
+                """, true));
+        final WorkflowRun run = job.scheduleBuild2(0).waitForStart();
+        jenkins.waitForMessage("working", run);
+
+        activate("euc2-blue");
+
+        jenkins.waitForCompletion(run);
+        jenkins.assertBuildStatus(Result.ABORTED, run);
+        jenkins.assertLogContains("DEACTIVATED", run);
+        jenkins.assertLogContains("'/dc/active' is now 'euc2-blue'", run);
+    }
+
+    @Test
+    void doesNotRunTheBodyWhereTheActiveKeyNamesAnotherValue(final JenkinsRule jenkins) throws Exception {
+        configure("euc1-blue");
+        activate("euc1-blue");
+
+        final WorkflowRun run = build(jenkins, "eod-inactive", """
+                piplexExclusive(key: 'eod', activeWhenKey: '/dc/active', activeWhenValue: 'euc1-green') {
+                    echo 'this must not run'
+                }
+                """);
+
+        jenkins.assertBuildStatus(Result.NOT_BUILT, run);
+        jenkins.assertLogNotContains("this must not run", run);
+        jenkins.assertLogContains("'/dc/active' is 'euc1-blue'", run);
     }
 
     @Test
@@ -713,6 +758,12 @@ class PiplexStepsTest {
     private void designate(final String owner) throws Exception {
         new Designations(store, time).designate("eod", owner, "handover")
                 .toCompletableFuture().get(10L, TimeUnit.SECONDS);
+    }
+
+    // As the external system would: a plain value, no JSON.
+    private void activate(final String value) throws Exception {
+        final String version = store.get(ACTIVE).toCompletableFuture().get(10L, TimeUnit.SECONDS).version();
+        assertTrue(store.compareAndSet(ACTIVE, version, value).toCompletableFuture().get(10L, TimeUnit.SECONDS));
     }
 
     private void disable(final String key, final String reason) throws Exception {
