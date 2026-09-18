@@ -42,13 +42,16 @@ class RecordsTest {
 
     static List<Kind<?>> kinds() {
         return List.of(
-                new Kind<>("piplex/designated/eod", Designations::keyOf, Designation::parse, Designation::toJson,
+                new Kind<>("piplex/default/designated/eod",
+                        key -> Designations.keyOf(Environment.DEFAULT, key), Designation::parse, Designation::toJson,
                         (store, time) -> new Designations(store, time).designate(KEY, "euc1-blue", "INC-4821"),
                         (store, time) -> new Designations(store, time).current(KEY)),
-                new Kind<>("piplex/enabled/eod", Switches::keyOf, Switch::parse, Switch::toJson,
+                new Kind<>("piplex/default/enabled/eod",
+                        key -> Switches.keyOf(Environment.DEFAULT, key), Switch::parse, Switch::toJson,
                         (store, time) -> new Switches(store, time).disable(KEY, "INC-4821"),
                         (store, time) -> new Switches(store, time).current(KEY)),
-                new Kind<>("piplex/milestone/eod", Milestones::keyOf, Milestone::parse, Milestone::toJson,
+                new Kind<>("piplex/default/milestone/eod",
+                        key -> Milestones.keyOf(Environment.DEFAULT, key), Milestone::parse, Milestone::toJson,
                         (store, time) -> new Milestones(store, time)
                                 .publish(KEY, Generation.of("2026-09-12"), "euc1-blue", "eod#142"),
                         (store, time) -> new Milestones(store, time).current(KEY)));

@@ -32,6 +32,7 @@ import io.github.green4j.discas.common.transport.security.PlaintextClientSecurit
 import io.github.green4j.discas.common.transport.tls.TlsClientSecurityProvider;
 import io.github.green4j.discas.common.transport.tls.TlsConfig;
 import io.github.green4j.discas.common.transport.tls.TlsContexts;
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Piplex;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.discas.DiscasCoordinationStore;
@@ -88,6 +89,8 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     private String ownerId;
     private String clientId;
     private String nodes;
+    // Which set of orchestrations this controller's work belongs to unless a step names another.
+    private String environment;
 
     private Secret token;
     private boolean tls;
@@ -168,6 +171,23 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     @DataBoundSetter
     public synchronized void setClientId(final String value) {
         this.clientId = trimmed(value);
+        changed();
+    }
+
+    /**
+     * @return the default environment as last entered, or {@code null} when none was
+     */
+    public synchronized String getEnvironment() {
+        return environment;
+    }
+
+    /**
+     * @param value which set of orchestrations this controller's work belongs to; blank means
+     *              {@link Environment#DEFAULT}
+     */
+    @DataBoundSetter
+    public synchronized void setEnvironment(final String value) {
+        this.environment = trimmed(value);
         changed();
     }
 
@@ -411,14 +431,16 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     }
 
     private Settings snapshot() {
-        return new Settings(ownerId, clientId, nodes, token, tls, tlsKeystore, tlsKeystorePassword,
-                tlsTruststore, tlsTruststorePassword, tlsVerifyNodeIdentity, watchPollPeriod);
+        return new Settings(ownerId, clientId, nodes, environment, token, tls, tlsKeystore,
+                tlsKeystorePassword, tlsTruststore, tlsTruststorePassword, tlsVerifyNodeIdentity,
+                watchPollPeriod);
     }
 
     private void restore(final Settings settings) {
         ownerId = settings.ownerId();
         clientId = settings.clientId();
         nodes = settings.nodes();
+        environment = settings.environment();
         token = settings.token();
         tls = settings.tls();
         tlsKeystore = settings.tlsKeystore();
@@ -441,6 +463,11 @@ public final class PiplexConfiguration extends GlobalConfiguration {
             cluster(settings);
         } catch (final AbortException refused) {
             throw new InvalidSetting("nodes", refused);
+        }
+        try {
+            environment(settings);
+        } catch (final AbortException refused) {
+            throw new InvalidSetting("environment", refused);
         }
         try {
             watchPollPeriod(settings);
@@ -473,6 +500,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     private record Settings(String ownerId,
                             String clientId,
                             String nodes,
+                            String environment,
                             Secret token,
                             boolean tls,
                             String tlsKeystore,
@@ -497,12 +525,53 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * controllers from four build logs.
      *
      * @param listener the run's log
-     * @return the primitives
+     * @return the primitives, in this controller's default environment
      * @throws AbortException if the controller has not been configured
      */
     public synchronized Piplex piplexFor(final TaskListener listener) throws AbortException {
+        return piplexFor(listener, null);
+    }
+
+    /**
+     * The primitives, as this run should see them, in the environment it asked for.
+     *
+     * @param listener the run's log
+     * @param named    the environment the step named, or {@code null} to use the controller's default
+     * @return the primitives
+     * @throws AbortException if the controller has not been configured, or the name cannot be one
+     */
+    public synchronized Piplex piplexFor(final TaskListener listener, final String named)
+            throws AbortException {
         return new Piplex(store(), time(),
-                new TextPiplexObserver(line -> listener.getLogger().println("piplex: " + line)));
+                new TextPiplexObserver(line -> listener.getLogger().println("piplex: " + line)),
+                environmentOf(named));
+    }
+
+    /**
+     * The environment a step's own value names, or this controller's default where it names none.
+     *
+     * @param named what the step asked for, may be {@code null} or blank
+     * @return the environment to work in
+     * @throws AbortException if what the step named cannot be an environment
+     */
+    public synchronized Environment environmentOf(final String named) throws AbortException {
+        if (named == null || named.isBlank()) {
+            return environment(applied);
+        }
+        try {
+            return Environment.of(named.trim());
+        } catch (final IllegalArgumentException refused) {
+            throw new AbortException("piplex: " + refused.getMessage()
+                    + ". It is the environment named by this step");
+        }
+    }
+
+    /**
+     * @return the environment this controller's work belongs to unless a step names another
+     * @throws AbortException if what was saved cannot name one
+     */
+    public synchronized Environment defaultEnvironment() throws AbortException {
+        return environment(applied);
     }
 
     /**
@@ -517,7 +586,21 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * @throws AbortException if the controller has not been configured
      */
     public synchronized Configured configuredFor(final TaskListener listener) throws AbortException {
-        final Configured configured = new Configured(requireOwnerId(), piplexFor(listener), time());
+        return configuredFor(listener, null);
+    }
+
+    /**
+     * The owner id and the primitives of one environment, from one reading of the settings.
+     *
+     * @param listener the run's log
+     * @param named    the environment the step named, or {@code null} for this controller's default
+     * @return both, as one settled answer
+     * @throws AbortException if the controller has not been configured, or the name cannot be one
+     */
+    public synchronized Configured configuredFor(final TaskListener listener, final String named)
+            throws AbortException {
+        final Configured configured =
+                new Configured(requireOwnerId(), piplexFor(listener, named), time());
         startHeartbeat();
         return configured;
     }
@@ -623,23 +706,29 @@ public final class PiplexConfiguration extends GlobalConfiguration {
         final String owner;
         final CoordinationStore beatStore;
         final OwnerHeartbeat beating;
+        // The controller's own, never a step's: the mark says this process is using this owner id, and
+        // a controller has exactly one identity however many environments it runs work in.
+        final Environment in;
         synchronized (this) {
             owner = applied.ownerId();
             beating = heartbeat;
             CoordinationStore found = null;
+            Environment saved = null;
             if (owner != null && owner.indexOf('/') < 0 && beating != null) {
                 try {
                     found = store();
+                    saved = defaultEnvironment();
                 } catch (final AbortException unconfigured) {
                     found = null;
                 }
             }
             beatStore = found;
+            in = saved;
         }
-        if (beatStore == null) {
+        if (beatStore == null || in == null) {
             return CompletableFuture.completedFuture(null);
         }
-        return beating.tick(beatStore, owner);
+        return beating.tick(beatStore, in, owner);
     }
 
     /**
@@ -794,6 +883,25 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      */
     Duration watchPollPeriod() throws AbortException {
         return watchPollPeriod(applied);
+    }
+
+    /**
+     * The environment saved, or the default where the field was left empty.
+     *
+     * @param settings the settings
+     * @return the environment every key this controller writes goes under
+     * @throws AbortException if what was typed cannot name one
+     */
+    private static Environment environment(final Settings settings) throws AbortException {
+        try {
+            return Environment.orDefault(settings.environment());
+        } catch (final IllegalArgumentException refused) {
+            // Said with the field named, once, on the settings page: it is the leading segment of every
+            // key this controller writes, and a night's worth of keys is the alternative place to find out.
+            throw new AbortException("piplex: " + refused.getMessage()
+                    + ". Set it in Manage Jenkins > System, or leave it empty for '"
+                    + Environment.DEFAULT + "'");
+        }
     }
 
     private static Duration watchPollPeriod(final Settings settings) throws AbortException {

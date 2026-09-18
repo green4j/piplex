@@ -17,6 +17,8 @@ If there is one controller and no cross-controller dependency, piplex is unneces
 - **Switches** enable, disable or drain work through shared state instead of a configuration deploy.
 - **Active keys** follow a value another system writes, such as the active data centre: work runs
   only where the value matches and moves when it changes.
+- **Environments** let one cluster serve several sets of orchestrations. Every key is under
+  `piplex/<environment>/`, so production and uat share no milestone, switch, designation or lease.
 
 ### Safety boundary
 
@@ -114,6 +116,9 @@ Implementations are constructed explicitly:
 ```java
 CoordinationStore store = new DiscasCoordinationStore(client);
 Piplex piplex = new Piplex(store, TimeSource.of(scheduler), observer);
+
+// A host serving several environments asks for the primitives of one:
+Piplex uat = piplex.in(Environment.of("uat"));
 ```
 
 The modules are not published to Maven. A release contains one `.hpi` with the required modules and

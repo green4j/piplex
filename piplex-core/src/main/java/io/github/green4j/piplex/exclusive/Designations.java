@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.exclusive;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.UnreadableKeyException;
 import io.github.green4j.piplex.observe.PiplexObserver;
@@ -27,11 +28,13 @@ import java.util.concurrent.CompletionStage;
  */
 public final class Designations {
 
-    private static final String PREFIX = "piplex/designated/";
+    private static final String KIND = "designated";
 
     private final CoordinationStore store;
     private final TimeSource time;
     private final PiplexObserver observer;
+    private final Environment environment;
+    private final String prefix;
 
     /**
      * @param store where designations are kept
@@ -49,26 +52,52 @@ public final class Designations {
     public Designations(final CoordinationStore store,
                         final TimeSource time,
                         final PiplexObserver observer) {
+        this(store, time, observer, Environment.DEFAULT);
+    }
+
+    /**
+     * @param store       where designations are kept
+     * @param time        where the timestamp in the record comes from
+     * @param observer    told when somebody else is designated
+     * @param environment which set of orchestrations these designations belong to
+     */
+    public Designations(final CoordinationStore store,
+                        final TimeSource time,
+                        final PiplexObserver observer,
+                        final Environment environment) {
         this.store = FailFastStore.of(store, time);
         this.time = Objects.requireNonNull(time, "time");
         this.observer = Objects.requireNonNull(observer, "observer");
+        this.environment = Objects.requireNonNull(environment, "environment");
+        this.prefix = environment.prefixOf(KIND);
     }
 
     /**
      * Where a designation is kept, for an operator reading the store by hand.
      *
-     * <p>Every way into this class goes through here, which is why the key is checked here: a blank one
-     * does not fail, it names the prefix itself, and then one designation speaks for every key.
-     *
-     * @param key what is being competed for
+     * @param environment which set of orchestrations it belongs to
+     * @param key         what is being competed for
      * @return the key it is held at
      * @throws IllegalArgumentException if the key is null or blank
      */
-    public static String keyOf(final String key) {
+    public static String keyOf(final Environment environment, final String key) {
+        Objects.requireNonNull(environment, "environment");
+        return environment.prefixOf(KIND) + checked(key);
+    }
+
+    /**
+     * Every way into this class goes through this check: a blank key does not fail, it names the
+     * prefix itself, and then one designation speaks for every key.
+     *
+     * @param key what is being competed for
+     * @return it, once it is worth composing a key from
+     * @throws IllegalArgumentException if the key is null or blank
+     */
+    private static String checked(final String key) {
         if (key == null || key.isBlank()) {
             throw new IllegalArgumentException("key must not be blank");
         }
-        return PREFIX + key;
+        return key;
     }
 
     /**
@@ -78,7 +107,7 @@ public final class Designations {
      * @return the record held, or {@code null} when nobody is designated yet
      */
     public CompletionStage<Designation> current(final String key) {
-        final String storeKey = keyOf(key);
+        final String storeKey = storeKeyOf(key);
         return store.get(storeKey).thenApply(entry -> designationOf(storeKey, entry));
     }
 
@@ -121,7 +150,7 @@ public final class Designations {
                                                          final String owner,
                                                          final String reason,
                                                          final boolean overwriteUnreadable) {
-        final String storeKey = keyOf(key);
+        final String storeKey = storeKeyOf(key);
         return CompareAndSetLoop.write(store, storeKey, entry -> {
             final Designation inForce = overwriteUnreadable
                     ? readableOrNull(storeKey, entry)
@@ -133,10 +162,15 @@ public final class Designations {
                     ? new Designation(owner, reason, time.wallTime(), null, 1L)
                     : inForce.succeededBy(owner, reason, time.wallTime());
             return Step.write(next.toJson(), () -> {
-                observer.designated(key, owner, inForce == null ? null : inForce.owner(), reason);
+                observer.designated(
+                        environment, key, owner, inForce == null ? null : inForce.owner(), reason);
                 return new DesignationChange(inForce, next, true);
             });
         });
+    }
+
+    private String storeKeyOf(final String key) {
+        return prefix + checked(key);
     }
 
     private static Designation readableOrNull(final String storeKey, final Entry entry) {

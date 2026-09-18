@@ -105,6 +105,7 @@ class StateFixturesTest {
     void readsVersion1() throws Exception {
         final ExclusiveStepExecution asking = execution(1, "asking.ser");
         assertEquals("eod", field(asking, "key"));
+        assertEquals("uat", field(asking, "environment"));
         assertEquals("7/3f0c9a1e", field(asking, "executionId"));
         assertEquals(OWNERSHIP_ID, field(asking, "ownershipId"));
         assertEquals("eod", field(asking, "designatedBy"));
@@ -183,6 +184,9 @@ class StateFixturesTest {
                         ExclusiveStepExecution.class, Object.class.getDeclaredConstructor());
         final ExclusiveStepExecution execution = (ExclusiveStepExecution) bare.newInstance();
         set(execution, "key", "eod");
+        // Not the default: what this pins is that a resumed step comes back in the environment it was
+        // admitted in, and a fixture recorded in the default one could not tell the two apart.
+        set(execution, "environment", "uat");
         set(execution, "executionId", "7/3f0c9a1e");
         set(execution, "ownershipId", OWNERSHIP_ID);
         set(execution, "designatedBy", "eod");

@@ -85,12 +85,14 @@ public final class DiscasStoreExample {
 
             Examples.say("=== " + key + " on the cluster, as " + clientId + " ===");
 
+            // These examples name no environment, so every key is in the default one. A host serving
+            // several asks piplex.in(Environment.of("uat")) for the primitives of another.
             final Designation designated = Examples.await(piplex.designations().current(key));
-            Examples.say(Designations.keyOf(key) + " -> "
+            Examples.say(Designations.keyOf(piplex.environment(), key) + " -> "
                     + (designated == null ? "nobody designated yet" : describe(designated)));
 
             final Milestone milestone = Examples.await(piplex.milestones().current(key));
-            Examples.say(Milestones.keyOf(key) + " -> "
+            Examples.say(Milestones.keyOf(piplex.environment(), key) + " -> "
                     + (milestone == null ? "nothing published yet" : describe(milestone)));
         }
     }

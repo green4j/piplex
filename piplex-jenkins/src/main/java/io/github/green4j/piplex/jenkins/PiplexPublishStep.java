@@ -18,6 +18,7 @@ import org.jenkinsci.plugins.workflow.steps.StepContext;
 import org.jenkinsci.plugins.workflow.steps.StepDescriptor;
 import org.jenkinsci.plugins.workflow.steps.StepExecution;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.DataBoundSetter;
 
 import java.util.Set;
 
@@ -32,6 +33,7 @@ public final class PiplexPublishStep extends Step {
 
     private final String key;
     private final String generation;
+    private String environment;
 
     /**
      * @param key        the milestone
@@ -51,9 +53,22 @@ public final class PiplexPublishStep extends Step {
         return generation;
     }
 
+    /**
+     * @param value which set of orchestrations this milestone belongs to; leave unset for the
+     *              controller's default, set in Manage Jenkins &gt; System
+     */
+    @DataBoundSetter
+    public void setEnvironment(final String value) {
+        this.environment = value;
+    }
+
+    public String getEnvironment() {
+        return environment;
+    }
+
     @Override
     public StepExecution start(final StepContext context) {
-        return new Execution(context, key, generation);
+        return new Execution(context, key, generation, environment);
     }
 
     /**
@@ -85,6 +100,8 @@ public final class PiplexPublishStep extends Step {
 
         private final String key;
         private final String generation;
+        // Written down with the rest: a resumed publish must write in the environment it began in.
+        private final String environment;
 
         // Not carried across a restart: onResume publishes again, and that write is nobody's to stop yet.
         private transient boolean answered;
@@ -92,10 +109,14 @@ public final class PiplexPublishStep extends Step {
         private transient boolean writing;
         private transient Throwable stoppedWith;
 
-        Execution(final StepContext context, final String key, final String generation) {
+        Execution(final StepContext context,
+                  final String key,
+                  final String generation,
+                  final String environment) {
             super(context);
             this.key = key;
             this.generation = generation;
+            this.environment = environment;
         }
 
         @Override
@@ -161,7 +182,7 @@ public final class PiplexPublishStep extends Step {
             final TaskListener listener = getContext().get(TaskListener.class);
             final Run<?, ?> run = getContext().get(Run.class);
             final PiplexConfiguration.Configured configured =
-                    PiplexConfiguration.require().configuredFor(listener);
+                    PiplexConfiguration.require().configuredFor(listener, environment);
             synchronized (this) {
                 writing = true;
             }

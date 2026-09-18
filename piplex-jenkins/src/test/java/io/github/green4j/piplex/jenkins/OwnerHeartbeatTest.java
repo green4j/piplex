@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.jenkins;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.store.CoordinationStore;
 import io.github.green4j.piplex.store.Entry;
@@ -84,8 +85,46 @@ class OwnerHeartbeatTest {
         beat(original, "euc1-green");
 
         assertNull(original.duplicated());
-        final Entry written = store.get(OwnerHeartbeat.keyOf("euc1-green")).toCompletableFuture().join();
+        final Entry written = store.get(OwnerHeartbeat.keyOf(Environment.DEFAULT, "euc1-green"))
+                .toCompletableFuture().join();
         assertTrue(written.exists());
+    }
+
+    @Test
+    void saysNothingAboutTheSameOwnerIdInAnotherEnvironment() throws Exception {
+        // Two deployments, not one duplicated. Sharing a cluster between production and uat is the
+        // ordinary reason a controller's owner id turns up twice, and warning about it would make the
+        // check cry wolf in exactly the setup the environment segment exists for.
+        final OwnerHeartbeat prod = new OwnerHeartbeat(time);
+        final OwnerHeartbeat uat = new OwnerHeartbeat(time);
+        final Environment other = Environment.of("uat");
+
+        beat(prod, OWNER);
+        uat.tick(store, other, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
+        beat(prod, OWNER);
+        uat.tick(store, other, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
+
+        assertNull(prod.duplicated());
+        assertNull(uat.duplicated());
+        assertTrue(store.get(OwnerHeartbeat.keyOf(Environment.DEFAULT, OWNER))
+                .toCompletableFuture().join().exists());
+        assertTrue(store.get(OwnerHeartbeat.keyOf(other, OWNER)).toCompletableFuture().join().exists(),
+                "Each environment keeps its own mark for the same owner id");
+    }
+
+    @Test
+    void startsOverWhenTheEnvironmentChanges() throws Exception {
+        final OwnerHeartbeat original = new OwnerHeartbeat(time);
+        final OwnerHeartbeat clone = new OwnerHeartbeat(time);
+        beat(original, OWNER);
+        beat(clone, OWNER);
+        beat(original, OWNER);
+        assertEquals(OWNER, original.duplicated());
+
+        // The operator fixed it by moving this controller to its own environment instead.
+        original.tick(store, Environment.of("uat"), OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
+
+        assertNull(original.duplicated(), "A new environment is a new key, with nothing seen on it");
     }
 
     @Test
@@ -94,12 +133,12 @@ class OwnerHeartbeatTest {
         final CoordinationStore readOnly =
                 refusingWrites(CompletableFuture.failedFuture(new IllegalStateException("Not authorized")));
 
-        refused.tick(readOnly, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
+        refused.tick(readOnly, Environment.DEFAULT, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
         assertNull(refused.silent(), "One refused beat is not yet a pattern");
 
         while (!time.passed(OwnerHeartbeat.SILENT_AFTER)) {
             time.advance(OwnerHeartbeat.EVERY);
-            refused.tick(readOnly, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
+            refused.tick(readOnly, Environment.DEFAULT, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
         }
         assertEquals(OWNER, refused.silent());
 
@@ -111,9 +150,9 @@ class OwnerHeartbeatTest {
     void saysNothingOnceItHasStoppedTrying() throws Exception {
         final OwnerHeartbeat refused = new OwnerHeartbeat(time);
         final CoordinationStore readOnly = refusingWrites(CompletableFuture.completedFuture(false));
-        refused.tick(readOnly, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
+        refused.tick(readOnly, Environment.DEFAULT, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
         time.advance(OwnerHeartbeat.SILENT_AFTER);
-        refused.tick(readOnly, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
+        refused.tick(readOnly, Environment.DEFAULT, OWNER).toCompletableFuture().get(10L, TimeUnit.SECONDS);
         assertEquals(OWNER, refused.silent());
 
         // The store was unconfigured: nothing asks any more, so nothing is failing either.
@@ -130,7 +169,7 @@ class OwnerHeartbeatTest {
     }
 
     private void beat(final OwnerHeartbeat heartbeat, final String owner) throws Exception {
-        heartbeat.tick(store, owner).toCompletableFuture().get(10L, TimeUnit.SECONDS);
+        heartbeat.tick(store, Environment.DEFAULT, owner).toCompletableFuture().get(10L, TimeUnit.SECONDS);
     }
 
     /**

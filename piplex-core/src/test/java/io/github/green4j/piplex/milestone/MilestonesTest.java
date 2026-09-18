@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.milestone;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.ManualTime;
 import io.github.green4j.piplex.SilentStore;
@@ -155,7 +156,7 @@ class MilestonesTest {
     @Test
     void repairsAMilestoneThatWillNotParse() {
         join(store.compareAndSet(
-                Milestones.keyOf(KEY), CoordinationStore.INITIAL_VERSION, "{\"generation\""));
+                Milestones.keyOf(Environment.DEFAULT, KEY), CoordinationStore.INITIAL_VERSION, "{\"generation\""));
 
         assertEquals(PublishResult.Outcome.PUBLISHED, join(milestones.repair(KEY, D2)).outcome());
         assertEquals(D2, join(milestones.current(KEY)).generation());

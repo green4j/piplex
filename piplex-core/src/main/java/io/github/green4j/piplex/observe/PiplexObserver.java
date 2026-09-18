@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.observe;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.exclusive.Revocation;
 
@@ -143,10 +144,15 @@ public interface PiplexObserver {
     /**
      * A wait ended because the milestone got far enough.
      *
-     * @param milestone the milestone key
-     * @param reached   how far it got
+     * <p>This and the three below it are the events with no run behind them -- an operator's call, or a
+     * wait made on its own -- so each names its environment itself, where the others have it from the
+     * {@link RunRef}.
+     *
+     * @param environment which set of orchestrations it belongs to
+     * @param milestone   the milestone key
+     * @param reached     how far it got
      */
-    default void milestoneReached(String milestone, Generation reached) {
+    default void milestoneReached(Environment environment, String milestone, Generation reached) {
     }
 
     /**
@@ -156,23 +162,26 @@ public interface PiplexObserver {
      * hour of waiting is an hour of silence, and silence is the one thing an operator cannot tell apart
      * from a hung build.
      *
-     * @param milestone  what is being waited for
-     * @param wanted     the generation needed
-     * @param reached    what is published now, or {@code null} when nothing is
+     * @param environment which set of orchestrations it belongs to
+     * @param milestone   what is being waited for
+     * @param wanted      the generation needed
+     * @param reached     what is published now, or {@code null} when nothing is
      * @param giveUpAfter how long the wait will last at most
      */
-    default void milestoneWaiting(String milestone, Generation wanted, Generation reached,
-                                  Duration giveUpAfter) {
+    default void milestoneWaiting(Environment environment, String milestone, Generation wanted,
+                                  Generation reached, Duration giveUpAfter) {
     }
 
     /**
      * A wait ended without the milestone getting far enough.
      *
-     * @param milestone the milestone key
-     * @param wanted    what was needed
-     * @param reached   how far it had got, or {@code null} when nothing was ever published
+     * @param environment which set of orchestrations it belongs to
+     * @param milestone   the milestone key
+     * @param wanted      what was needed
+     * @param reached     how far it had got, or {@code null} when nothing was ever published
      */
-    default void milestoneTimedOut(String milestone, Generation wanted, Generation reached) {
+    default void milestoneTimedOut(Environment environment, String milestone, Generation wanted,
+                                   Generation reached) {
     }
 
     /**
@@ -181,21 +190,24 @@ public interface PiplexObserver {
      * <p>Said by the process that made the change, so it is as trustworthy as that process: the log
      * of an authenticated job, not an audit trail.
      *
-     * @param key      what is competed for
-     * @param owner    who is designated now
-     * @param previous who was, or {@code null} when nobody was or the value did not parse
-     * @param reason   why, may be {@code null}
+     * @param environment which set of orchestrations it belongs to
+     * @param key         what is competed for
+     * @param owner       who is designated now
+     * @param previous    who was, or {@code null} when nobody was or the value did not parse
+     * @param reason      why, may be {@code null}
      */
-    default void designated(String key, String owner, String previous, String reason) {
+    default void designated(Environment environment, String key, String owner, String previous,
+                            String reason) {
     }
 
     /**
      * A switch was flipped.
      *
-     * @param key     the switch
-     * @param enabled whether the work may run now
-     * @param reason  why, may be {@code null}
+     * @param environment which set of orchestrations it belongs to
+     * @param key         the switch
+     * @param enabled     whether the work may run now
+     * @param reason      why, may be {@code null}
      */
-    default void switched(String key, boolean enabled, String reason) {
+    default void switched(Environment environment, String key, boolean enabled, String reason) {
     }
 }

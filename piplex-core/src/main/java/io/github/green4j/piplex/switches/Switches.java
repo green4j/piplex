@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.switches;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.UnreadableKeyException;
 import io.github.green4j.piplex.observe.PiplexObserver;
@@ -27,12 +28,14 @@ import java.util.concurrent.CompletionStage;
  */
 public final class Switches {
 
-    private static final String PREFIX = "piplex/enabled/";
+    private static final String KIND = "enabled";
     private static final String OWNER_MARK = "/@";
 
     private final CoordinationStore store;
     private final TimeSource time;
     private final PiplexObserver observer;
+    private final Environment environment;
+    private final String prefix;
 
     /**
      * @param store where switches are kept
@@ -48,26 +51,52 @@ public final class Switches {
      * @param observer told when a switch is flipped
      */
     public Switches(final CoordinationStore store, final TimeSource time, final PiplexObserver observer) {
+        this(store, time, observer, Environment.DEFAULT);
+    }
+
+    /**
+     * @param store       where switches are kept
+     * @param time        what times the store's answers and stamps the record
+     * @param observer    told when a switch is flipped
+     * @param environment which set of orchestrations these switches belong to
+     */
+    public Switches(final CoordinationStore store,
+                    final TimeSource time,
+                    final PiplexObserver observer,
+                    final Environment environment) {
         this.store = FailFastStore.of(store, time);
         this.time = Objects.requireNonNull(time, "time");
         this.observer = Objects.requireNonNull(observer, "observer");
+        this.environment = Objects.requireNonNull(environment, "environment");
+        this.prefix = environment.prefixOf(KIND);
     }
 
     /**
      * Where a switch is kept, for an operator reading the store by hand.
      *
-     * <p>Every way into this class goes through here, which is why the key is checked here: a blank one
-     * does not fail, it names the prefix itself, and then one write drains the whole controller.
-     *
-     * @param key the switch
+     * @param environment which set of orchestrations it belongs to
+     * @param key         the switch
      * @return the key it is held at
      * @throws IllegalArgumentException if the key is null or blank
      */
-    public static String keyOf(final String key) {
+    public static String keyOf(final Environment environment, final String key) {
+        Objects.requireNonNull(environment, "environment");
+        return environment.prefixOf(KIND) + checked(key);
+    }
+
+    /**
+     * Every way into this class goes through this check: a blank key does not fail, it names the
+     * prefix itself, and then one write drains the whole controller.
+     *
+     * @param key the switch
+     * @return it, once it is worth composing a key from
+     * @throws IllegalArgumentException if the key is null or blank
+     */
+    private static String checked(final String key) {
         if (key == null || key.isBlank()) {
             throw new IllegalArgumentException("key must not be blank");
         }
-        return PREFIX + key;
+        return key;
     }
 
     /**
@@ -100,7 +129,7 @@ public final class Switches {
      * @return what is in force, {@link Switch#ENABLED} when the key holds nothing
      */
     public CompletionStage<Switch> current(final String key) {
-        final String storeKey = keyOf(key);
+        final String storeKey = storeKeyOf(key);
         return store.get(storeKey).thenApply(entry -> switchOf(storeKey, entry));
     }
 
@@ -142,7 +171,7 @@ public final class Switches {
                                               final boolean enabled,
                                               final String reason,
                                               final boolean overwriteUnreadable) {
-        final String storeKey = keyOf(key);
+        final String storeKey = storeKeyOf(key);
         return CompareAndSetLoop.write(store, storeKey, entry -> {
             final Switch inForce = overwriteUnreadable
                     ? readableOrNull(storeKey, entry)
@@ -152,10 +181,14 @@ public final class Switches {
             }
             final Switch next = new Switch(enabled, reason, time.wallTime());
             return Step.write(next.toJson(), () -> {
-                observer.switched(key, enabled, reason);
+                observer.switched(environment, key, enabled, reason);
                 return new SwitchChange(inForce, next, true);
             });
         });
+    }
+
+    private String storeKeyOf(final String key) {
+        return prefix + checked(key);
     }
 
     private static Switch readableOrNull(final String storeKey, final Entry entry) {

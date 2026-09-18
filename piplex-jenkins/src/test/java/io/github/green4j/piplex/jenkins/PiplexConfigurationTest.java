@@ -16,6 +16,7 @@ import hudson.model.Saveable;
 import hudson.model.listeners.SaveableListener;
 import io.github.green4j.discas.common.KvLimits;
 import io.github.green4j.discas.common.identity.NodeId;
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.store.CoordinationStore;
 import net.sf.json.JSONObject;
 import org.junit.jupiter.api.Test;
@@ -82,6 +83,7 @@ class PiplexConfigurationTest {
         final PiplexConfiguration configuration = PiplexConfiguration.get();
         configuration.setOwnerId("euc1-blue");
         configuration.setNodes("n1=10.0.0.1:7101, n2=10.0.0.2:7101");
+        configuration.setEnvironment("prod");
         configuration.setWatchPollPeriod("30s");
 
         final AtomicInteger saved = saves(configuration);
@@ -93,6 +95,42 @@ class PiplexConfigurationTest {
         assertEquals(1, saved.get(), "One Save of the form is one change, whatever it touched");
         assertEquals("euc1-blue", configuration.getOwnerId());
         assertEquals("30s", configuration.getWatchPollPeriod());
+        // Through the form and back, which is also what says the field on the page is named right.
+        assertEquals("prod", configuration.getEnvironment());
+        assertEquals(Environment.of("prod"), configuration.defaultEnvironment());
+    }
+
+    @Test
+    void refusesAnEnvironmentWhichCannotBeOne(final JenkinsRule jenkins) throws Exception {
+        final PiplexConfiguration configuration = PiplexConfiguration.get();
+        configuration.setEnvironment("uat");
+
+        // A '/' would not make a second environment, it would rename the kind of record after it.
+        final String refused = refused(() -> configuration.setEnvironment("team/blue"));
+
+        assertTrue(refused.contains("must not contain '/'"), refused);
+        assertTrue(refused.contains("Manage Jenkins"), refused);
+        assertEquals(Environment.of("uat"), configuration.defaultEnvironment(),
+                "The one in force stays in force");
+    }
+
+    @Test
+    void worksInTheDefaultEnvironmentUntilOneIsNamed(final JenkinsRule jenkins) throws Exception {
+        final PiplexConfiguration configuration = PiplexConfiguration.get();
+        assertEquals(Environment.DEFAULT, configuration.defaultEnvironment());
+
+        configuration.setEnvironment("   ");
+        assertNull(configuration.getEnvironment());
+        assertEquals(Environment.DEFAULT, configuration.defaultEnvironment(),
+                "Blank is the default, not a blank environment");
+
+        configuration.setEnvironment("  uat  ");
+        assertEquals(Environment.of("uat"), configuration.defaultEnvironment());
+
+        // What a step asks for wins over it, and a step which asks for nothing gets it.
+        assertEquals(Environment.of("prod"), configuration.environmentOf("prod"));
+        assertEquals(Environment.of("uat"), configuration.environmentOf(null));
+        assertEquals(Environment.of("uat"), configuration.environmentOf(" "));
     }
 
     @Test

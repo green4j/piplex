@@ -10,6 +10,7 @@ package io.github.green4j.piplex.jenkins;
 import hudson.model.Computer;
 import hudson.model.Executor;
 import hudson.model.Result;
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.exclusive.Admission;
 import io.github.green4j.piplex.exclusive.Admitted;
@@ -227,7 +228,12 @@ public class PiplexRestartTest {
                     piplexExclusive(key: 'eod-admitted', designatedBy: 'eod-admitted',
                                     generation: '2026-09-12', lease: '30s') {
                         echo 'the body started'
-                        waitUntil { currentBuild.description == 'go' }
+                        // Not waitUntil: between bodies it writes down that none is running, and a
+                        // write during shutdown is skipped -- resumed, it waits forever on a body
+                        // which ended before the restart. sleep re-arms from a written-down deadline.
+                        while (currentBuild.description != 'go') {
+                            sleep 1
+                        }
                     }
                     """, true));
             final WorkflowRun run = job.scheduleBuild2(0).waitForStart();
@@ -311,7 +317,7 @@ public class PiplexRestartTest {
         scribbleOn("eod-scribbled");
         controllerCameBack();
 
-        assertResumedAs("eod-scribbled", Result.FAILURE, Designations.keyOf("eod-scribbled"));
+        assertResumedAs("eod-scribbled", Result.FAILURE, Designations.keyOf(Environment.DEFAULT, "eod-scribbled"));
     }
 
     /**
@@ -588,7 +594,7 @@ public class PiplexRestartTest {
      * @throws Exception if the cluster cannot be written to
      */
     private static void scribbleOn(final String key) throws Exception {
-        final String path = Designations.keyOf(key);
+        final String path = Designations.keyOf(Environment.DEFAULT, key);
         final Entry asRead = CLUSTER.get(path).toCompletableFuture().get(10L, TimeUnit.SECONDS);
         CLUSTER.compareAndSet(path, asRead.version(), "euc1-blue")
                 .toCompletableFuture().get(10L, TimeUnit.SECONDS);

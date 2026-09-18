@@ -42,7 +42,13 @@ Open **Manage Jenkins > System > piplex**.
 |---|---|---|
 | Owner id | `euc1-blue` | `euc1-green` |
 | Client id | `piplex-euc1-blue` | `piplex-euc1-green` |
+| Default environment | leave empty | leave empty |
 | discas nodes | the same `nodeId=host:port` list | the same list |
+
+Both controllers must agree on the environment, since it is a segment of every key: two controllers
+competing for one piece of work have to look at one key. Left empty it is `default`, which is right
+until this cluster also holds another set of orchestrations -- see
+[discas and security](07-discas.md#environments-and-cluster-ids).
 
 Example node list:
 

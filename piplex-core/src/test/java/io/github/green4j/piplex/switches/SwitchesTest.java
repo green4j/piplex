@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.switches;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.ManualTime;
 import io.github.green4j.piplex.store.CoordinationStore;
 import io.github.green4j.piplex.store.memory.InMemoryCoordinationStore;
@@ -65,7 +66,7 @@ class SwitchesTest {
     @Test
     void writesNothingWhenWhatIsAskedForIsAlreadyInForce() {
         assertFalse(join(switches.enable(KEY)).changed());
-        assertFalse(join(store.get(Switches.keyOf(KEY))).exists(),
+        assertFalse(join(store.get(Switches.keyOf(Environment.DEFAULT, KEY))).exists(),
                 "An absent key already means on, so there is nothing to write");
 
         final Switch off = join(switches.disable(KEY, "INC-4821")).inForce();
@@ -80,8 +81,9 @@ class SwitchesTest {
 
     @Test
     void keepsAnOwnersSwitchApartFromTheWorkSwitchesUnderTheSameKey() {
-        assertEquals("piplex/enabled/eod/euc1-blue", Switches.keyOf("eod/euc1-blue"));
-        assertEquals("piplex/enabled/eod/@blue", Switches.keyOf(Switches.ownerKey(KEY, "blue")));
+        assertEquals("piplex/default/enabled/eod/euc1-blue", Switches.keyOf(Environment.DEFAULT, "eod/euc1-blue"));
+        assertEquals("piplex/default/enabled/eod/@blue",
+                Switches.keyOf(Environment.DEFAULT, Switches.ownerKey(KEY, "blue")));
         assertTrue(Switches.namesAnOwner(Switches.ownerKey(KEY, "team/blue")));
         assertFalse(Switches.namesAnOwner("eod/blue"));
     }
@@ -99,12 +101,13 @@ class SwitchesTest {
     }
 
     private String version() {
-        return join(store.get(Switches.keyOf(KEY))).version();
+        return join(store.get(Switches.keyOf(Environment.DEFAULT, KEY))).version();
     }
 
     @Test
     void repairsAValueThatWillNotParse() {
-        join(store.compareAndSet(Switches.keyOf(KEY), CoordinationStore.INITIAL_VERSION, "{\"owner\""));
+        join(store.compareAndSet(Switches.keyOf(Environment.DEFAULT, KEY),
+                CoordinationStore.INITIAL_VERSION, "{\"owner\""));
 
         final Switch off = new Switch(false, "INC-4821", time.wallTime());
         assertEquals(new SwitchChange(null, off, true), join(switches.repair(KEY, false, "INC-4821")));
@@ -123,8 +126,8 @@ class SwitchesTest {
         join(logged.enable(KEY));
 
         assertEquals(List.of(
-                "SWITCHED key=eod enabled=false reason=INC-4821",
-                "SWITCHED key=eod enabled=true"), lines);
+                "SWITCHED environment=default key=eod enabled=false reason=INC-4821",
+                "SWITCHED environment=default key=eod enabled=true"), lines);
     }
 
     private static <T> T join(final CompletionStage<T> stage) {

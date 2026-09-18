@@ -14,6 +14,13 @@ import io.github.green4j.piplex.jenkins.PiplexConfiguration
 def piplex = PiplexConfiguration.get().piplexFor(TaskListener.NULL)
 ```
 
+That gives the controller's default environment. Every procedure below changes only the environment
+it was asked for, so name the one you mean where a controller serves several:
+
+```groovy
+def uat = PiplexConfiguration.get().piplexFor(TaskListener.NULL, 'uat')
+```
+
 Prefer an authenticated job using its real `listener`; it provides an approval trail and writes the
 operation to that build's log. Always wait for completion before proceeding:
 
@@ -79,12 +86,12 @@ This is the same promise a producer makes and consumers trust it equally.
 
 | Key | Inspect for |
 |---|---|
-| `piplex/designated/<designatedBy>` | Current designated owner |
-| `piplex/enabled/<enabledBy>` | Shared switch |
-| `piplex/enabled/<enabledBy>/@<ownerId>` | Per-owner drain |
-| `piplex/milestone/<key>` | Highest completed generation |
-| `piplex/exclusive/<key>` | Store-native lease; never edit manually |
-| `piplex/instances/<ownerId>` | Jenkins duplicate-owner heartbeat |
+| `piplex/<environment>/designated/<designatedBy>` | Current designated owner |
+| `piplex/<environment>/enabled/<enabledBy>` | Shared switch |
+| `piplex/<environment>/enabled/<enabledBy>/@<ownerId>` | Per-owner drain |
+| `piplex/<environment>/milestone/<key>` | Highest completed generation |
+| `piplex/<environment>/exclusive/<key>` | Store-native lease; never edit manually |
+| `piplex/<environment>/instances/<ownerId>` | Jenkins duplicate-owner heartbeat, in the controller's own environment |
 
 The first four value records are readable JSON. The exclusive record is binary/store-native.
 
@@ -92,11 +99,11 @@ The first four value records are readable JSON. The exclusive record is binary/s
 
 | Build says | Check or do |
 |---|---|
-| Another owner is designated | Read `piplex/designated/<designatedBy>` |
+| Another owner is designated | Read `piplex/<environment>/designated/<designatedBy>` |
 | Nobody is designated | Run `designate()` once |
 | Another execution holds the lease | Inspect the owner/run named in the message |
 | Another acquire won the write race | Retry or let `handoverWait` take another look |
-| The generation is already complete | Read `piplex/milestone/<completedWhen>` |
+| The generation is already complete | Read `piplex/<environment>/milestone/<completedWhen>` |
 | Work is disabled | Read the shared and per-owner switches |
 | A guard is unreadable | Repair the key from known-good state |
 | Owner id is missing | Configure `ownerId` |
@@ -114,12 +121,14 @@ that names versions. The embedded discas client and every node must use the same
 Every decision is logged as one event followed by `key=value` fields:
 
 ```text
-piplex: ADMITTED key=eod generation=2026-09-14 owner=euc1-blue run=eod#142 fencingToken=8
-piplex: REVOKED key=eod generation=2026-09-14 owner=euc1-blue run=eod#142 reason=DESIGNATION_CHANGED newOwner=euc1-green
-piplex: NOT_DESIGNATED key=eod generation=2026-09-14 owner=apac1 currentOwner=euc1-blue
+piplex: ADMITTED environment=prod key=eod generation=2026-09-14 owner=euc1-blue run=eod#142 fencingToken=8
+piplex: REVOKED environment=prod key=eod generation=2026-09-14 owner=euc1-blue run=eod#142 reason=DESIGNATION_CHANGED newOwner=euc1-green
+piplex: NOT_DESIGNATED environment=prod key=eod generation=2026-09-14 owner=apac1 currentOwner=euc1-blue
 ```
 
-Correlate by `key` and `generation` across controller logs. Important revocation reasons:
+Correlate by `environment`, `key` and `generation` across controller logs. The environment is on
+every line because one controller may run the same key in several of them, and two such lines are
+otherwise indistinguishable. Important revocation reasons:
 
 | Reason | Interpretation |
 |---|---|

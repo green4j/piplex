@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.milestone;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.UnreadableKeyException;
 import io.github.green4j.piplex.observe.PiplexObserver;
@@ -34,7 +35,7 @@ import java.util.concurrent.CompletionStage;
  */
 public final class Milestones {
 
-    private static final String PREFIX = "piplex/milestone/";
+    private static final String KIND = "milestone";
     // The longest one watch is given. A watch cannot be called off, so this is how long a wait that
     // nobody is waiting on any more can go on.
     static final Duration ROUND = Duration.ofMinutes(1);
@@ -42,6 +43,8 @@ public final class Milestones {
     private final CoordinationStore store;
     private final TimeSource time;
     private final PiplexObserver observer;
+    private final Environment environment;
+    private final String prefix;
 
     /**
      * @param store where milestones are kept
@@ -59,9 +62,24 @@ public final class Milestones {
     public Milestones(final CoordinationStore store,
                       final TimeSource time,
                       final PiplexObserver observer) {
+        this(store, time, observer, Environment.DEFAULT);
+    }
+
+    /**
+     * @param store       where milestones are kept
+     * @param time        where time comes from
+     * @param observer    told when a milestone moves or a wait ends
+     * @param environment which set of orchestrations these milestones belong to
+     */
+    public Milestones(final CoordinationStore store,
+                      final TimeSource time,
+                      final PiplexObserver observer,
+                      final Environment environment) {
         this.store = FailFastStore.of(store, time);
         this.time = Objects.requireNonNull(time, "time");
         this.observer = Objects.requireNonNull(observer, "observer");
+        this.environment = Objects.requireNonNull(environment, "environment");
+        this.prefix = environment.prefixOf(KIND);
     }
 
     /**
@@ -134,25 +152,40 @@ public final class Milestones {
      * @return the record held, or {@code null} when the key holds nothing yet
      */
     public CompletionStage<Milestone> current(final String key) {
-        final String storeKey = keyOf(key);
+        final String storeKey = storeKeyOf(key);
         return store.get(storeKey).thenApply(entry -> milestoneOf(storeKey, entry));
     }
 
     /**
      * Where a milestone is kept, for an operator reading the store by hand.
      *
-     * <p>Every way into this class goes through here, which is why the key is checked here: a blank one
-     * does not fail, it names the prefix itself, and then every milestone on the controller is one.
-     *
-     * @param key the milestone
+     * @param environment which set of orchestrations it belongs to
+     * @param key         the milestone
      * @return the key it is held at
      * @throws IllegalArgumentException if the key is null or blank
      */
-    public static String keyOf(final String key) {
+    public static String keyOf(final Environment environment, final String key) {
+        Objects.requireNonNull(environment, "environment");
+        return environment.prefixOf(KIND) + checked(key);
+    }
+
+    /**
+     * Every way into this class goes through this check: a blank key does not fail, it names the
+     * prefix itself, and then every milestone in the environment is one.
+     *
+     * @param key the milestone
+     * @return it, once it is worth composing a key from
+     * @throws IllegalArgumentException if the key is null or blank
+     */
+    private static String checked(final String key) {
         if (key == null || key.isBlank()) {
             throw new IllegalArgumentException("key must not be blank");
         }
-        return PREFIX + key;
+        return key;
+    }
+
+    private String storeKeyOf(final String key) {
+        return prefix + checked(key);
     }
 
     private CompletionStage<PublishResult> publish(final String key,
@@ -160,7 +193,7 @@ public final class Milestones {
                                                    final String by,
                                                    final String runId,
                                                    final boolean overwriteUnreadable) {
-        final String storeKey = keyOf(key);
+        final String storeKey = storeKeyOf(key);
         return CompareAndSetLoop.write(store, storeKey, entry -> {
             Milestone inForce = null;
             try {
@@ -170,7 +203,9 @@ public final class Milestones {
                     // Said in the run's own log as well as thrown: a producer whose milestone key was
                     // hand-edited is fixed by an operator reading that log, not the stack trace.
                     observer.guardUnreadable(
-                            new RunRef(key, generation, by, runId), storeKey, notReadable.getMessage());
+                            new RunRef(environment, key, generation, by, runId),
+                            storeKey,
+                            notReadable.getMessage());
                     throw notReadable;
                 }
             }
@@ -179,7 +214,7 @@ public final class Milestones {
             }
             final Milestone next = new Milestone(generation, by, runId, time.wallTime());
             return Step.write(next.toJson(), () -> {
-                observer.milestonePublished(new RunRef(key, generation, by, runId));
+                observer.milestonePublished(new RunRef(environment, key, generation, by, runId));
                 return new PublishResult(PublishResult.Outcome.PUBLISHED, next);
             });
         });
@@ -201,7 +236,7 @@ public final class Milestones {
                                                final long deadlineNanos,
                                                final Duration announce,
                                                final CompletableFuture<AwaitResult> answer) {
-        final String storeKey = keyOf(key);
+        final String storeKey = storeKeyOf(key);
         if (answer.isDone()) {
             return CompletableFuture.failedFuture(
                     new CancellationException("The wait for '" + key + "' was abandoned"));
@@ -209,17 +244,17 @@ public final class Milestones {
         return store.get(storeKey).thenCompose(entry -> {
             final Milestone inForce = milestoneOf(storeKey, entry);
             if (inForce != null && inForce.generation().atLeast(generation)) {
-                observer.milestoneReached(key, inForce.generation());
+                observer.milestoneReached(environment, key, inForce.generation());
                 return CompletableFuture.completedFuture(
                         new AwaitResult(AwaitResult.Outcome.REACHED, inForce));
             }
             if (announce != null) {
-                observer.milestoneWaiting(key, generation,
+                observer.milestoneWaiting(environment, key, generation,
                         inForce == null ? null : inForce.generation(), announce);
             }
             final Duration remaining = time.until(deadlineNanos);
             if (remaining.isZero()) {
-                observer.milestoneTimedOut(key, generation,
+                observer.milestoneTimedOut(environment, key, generation,
                         inForce == null ? null : inForce.generation());
                 return CompletableFuture.completedFuture(
                         new AwaitResult(AwaitResult.Outcome.TIMED_OUT, inForce));

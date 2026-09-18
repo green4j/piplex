@@ -79,11 +79,11 @@ independently. Neither extends ownership past the current lease term. See
 A candidate that is not designated or not active, or finds the lease occupied, may wait for `handoverWait`.
 Parking holds no thread or executor. Each bounded round watches:
 
-- `piplex/designated/<designatedBy>`;
-- `piplex/enabled/<enabledBy>`;
-- `piplex/enabled/<enabledBy>/@<ownerId>`;
+- `piplex/<environment>/designated/<designatedBy>`;
+- `piplex/<environment>/enabled/<enabledBy>`;
+- `piplex/<environment>/enabled/<enabledBy>/@<ownerId>`;
 - `<activeKey>`;
-- `piplex/milestone/<completedWhen>`;
+- `piplex/<environment>/milestone/<completedWhen>`;
 - plus a timer, because the lease itself has no watch.
 
 Only configured keys are watched. Every round then reads all guards again. After a guard changes,
