@@ -38,6 +38,7 @@ public final class PiplexAwaitStep extends Step {
 
     private final String key;
     private final String generation;
+    private String environment;
     private String timeout;
     private boolean skipOnTimeout;
 
@@ -83,6 +84,19 @@ public final class PiplexAwaitStep extends Step {
         this.skipOnTimeout = value;
     }
 
+    /**
+     * @param value which set of orchestrations this work belongs to; leave unset for the controller's
+     *              default, set in Manage Jenkins &gt; System
+     */
+    @DataBoundSetter
+    public void setEnvironment(final String value) {
+        this.environment = value;
+    }
+
+    public String getEnvironment() {
+        return environment;
+    }
+
     @Override
     public StepExecution start(final StepContext context) {
         return new Execution(context, this);
@@ -118,6 +132,8 @@ public final class PiplexAwaitStep extends Step {
 
         private final String key;
         private final String generation;
+        // Written down with the rest: a resumed wait must look in the environment it began in.
+        private final String environment;
         private final String timeout;
         private final boolean skipOnTimeout;
 
@@ -130,6 +146,7 @@ public final class PiplexAwaitStep extends Step {
             super(context);
             this.key = step.getKey();
             this.generation = step.getGeneration();
+            this.environment = step.getEnvironment();
             this.timeout = step.getTimeout();
             this.skipOnTimeout = step.isSkipOnTimeout();
         }
@@ -192,7 +209,7 @@ public final class PiplexAwaitStep extends Step {
         private void await() throws Exception {
             final TaskListener listener = getContext().get(TaskListener.class);
             final CompletableFuture<AwaitResult> asked = PiplexConfiguration.require()
-                    .piplexFor(listener).milestones()
+                    .piplexFor(listener, environment).milestones()
                     .awaitAtLeast(key, Generation.of(generation),
                             Durations.parse(timeout, DEFAULT_TIMEOUT, "timeout"))
                     .toCompletableFuture();

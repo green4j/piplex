@@ -29,6 +29,7 @@ import java.util.Set;
 public final class PiplexExclusiveStep extends Step {
 
     private final String key;
+    private String environment;
     private String designatedBy;
     private String generation;
     private String completedWhen;
@@ -55,6 +56,19 @@ public final class PiplexExclusiveStep extends Step {
 
     public String getDesignatedBy() {
         return designatedBy;
+    }
+
+    /**
+     * @param value which set of orchestrations this work belongs to; leave unset for the controller's
+     *              default, set in Manage Jenkins &gt; System
+     */
+    @DataBoundSetter
+    public void setEnvironment(final String value) {
+        this.environment = value;
+    }
+
+    public String getEnvironment() {
+        return environment;
     }
 
     /**

@@ -11,6 +11,7 @@ io.github.green4j.piplex.jenkins.ExclusiveStepExecution
     completedWhen Ljava/lang/String;
     designatedBy Ljava/lang/String;
     enabledBy Ljava/lang/String;
+    environment Ljava/lang/String;
     executionId Ljava/lang/String;
     generation Ljava/lang/String;
     guardGrace Ljava/lang/String;
@@ -28,11 +29,13 @@ io.github.green4j.piplex.jenkins.NodeIdentity$Kind
 io.github.green4j.piplex.jenkins.PiplexAwaitStep$Execution
     serialVersionUID 1
     skipOnTimeout Z
+    environment Ljava/lang/String;
     generation Ljava/lang/String;
     key Ljava/lang/String;
     timeout Ljava/lang/String;
 io.github.green4j.piplex.jenkins.PiplexConfiguration
     clientId java.lang.String
+    environment java.lang.String
     nodes java.lang.String
     ownerId java.lang.String
     tls boolean
@@ -84,6 +87,7 @@ io.github.green4j.piplex.jenkins.PiplexOwnership
     key Ljava/lang/String;
 io.github.green4j.piplex.jenkins.PiplexPublishStep$Execution
     serialVersionUID 1
+    environment Ljava/lang/String;
     generation Ljava/lang/String;
     key Ljava/lang/String;
 io.github.green4j.piplex.jenkins.PiplexTokenStep$Execution

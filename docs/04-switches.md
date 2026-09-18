@@ -5,7 +5,7 @@ configuration and also revoke matching runs already in flight.
 
 ### Shared switch
 
-An absent `piplex/enabled/<key>` means enabled. Disabling is the deliberate state:
+An absent `piplex/<environment>/enabled/<key>` means enabled. Disabling is the deliberate state:
 
 ```java
 switches.disable("eod-switch", "INC-4821");
@@ -23,7 +23,7 @@ whether a write occurred.
 The same request also reads a per-owner switch:
 
 ```text
-piplex/enabled/<enabledBy>/@<ownerId>
+piplex/<environment>/enabled/<enabledBy>/@<ownerId>
 ```
 
 To drain blue while other owners remain eligible:

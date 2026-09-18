@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.exclusive;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.ManualTime;
 import io.github.green4j.piplex.SilentStore;
@@ -97,7 +98,7 @@ class ExclusiveRunsTest {
             }
             case "removed" -> {
                 designate(GREEN);
-                remove(Designations.keyOf(KEY));
+                remove(Designations.keyOf(Environment.DEFAULT, KEY));
                 yield null;
             }
             default -> null;
@@ -336,7 +337,7 @@ class ExclusiveRunsTest {
         // made with the lease already in hand.
         final ExclusiveRuns racing = new ExclusiveRuns(
                 new RacedAcquireStore(flaky,
-                        () -> flaky.stopAnsweringReadsOf(Milestones.keyOf("data/euc1"))),
+                        () -> flaky.stopAnsweringReadsOf(Milestones.keyOf(Environment.DEFAULT, "data/euc1"))),
                 time);
 
         final CompletionException failed = assertThrows(CompletionException.class,
@@ -358,7 +359,7 @@ class ExclusiveRunsTest {
         final UnreachableStore flaky = new UnreachableStore(store);
         final ExclusiveRuns racing = new ExclusiveRuns(
                 new RacedAcquireStore(flaky, () -> {
-                    flaky.stopAnsweringReadsOf(Milestones.keyOf("data/euc1"));
+                    flaky.stopAnsweringReadsOf(Milestones.keyOf(Environment.DEFAULT, "data/euc1"));
                     flaky.stopAnsweringReleases();
                 }),
                 time);
@@ -384,7 +385,7 @@ class ExclusiveRunsTest {
     @ParameterizedTest
     @MethodSource("switchesThatStopBlue")
     void doesNotRunWhenSwitchedOff(final String switched) {
-        put(ExclusiveRuns.switchKey(switched), new Switch(false, "patching", null).toJson());
+        put(ExclusiveRuns.switchKey(Environment.DEFAULT, switched), new Switch(false, "patching", null).toJson());
 
         final Admission off = join(runs.begin(elected(BLUE).enabledBy(KEY).build()));
 
@@ -453,7 +454,7 @@ class ExclusiveRunsTest {
     void givesTheLeaseBackWhenThePublishFails() {
         final Admitted held = assertInstanceOf(Admitted.class, join(runs.begin(completing(BLUE).build())));
         // Hand-edited while the run was working.
-        put(Milestones.keyOf("data/euc1"), "not a milestone");
+        put(Milestones.keyOf(Environment.DEFAULT, "data/euc1"), "not a milestone");
 
         assertThrows(CompletionException.class, () -> join(held.completeAndRelease()));
 
@@ -792,7 +793,7 @@ class ExclusiveRunsTest {
                 join(runs.begin(elected(BLUE).enabledBy(KEY).build())));
         final List<Revocation> seen = revocations(held);
 
-        put(ExclusiveRuns.switchKey(switched), new Switch(false, "incident 4711", null).toJson());
+        put(ExclusiveRuns.switchKey(Environment.DEFAULT, switched), new Switch(false, "incident 4711", null).toJson());
 
         assertFalse(held.isHeld());
         // Whoever finds the stopped build has to be told which incident, not sent to ask somebody.
@@ -805,7 +806,7 @@ class ExclusiveRunsTest {
         final Admitted held = assertInstanceOf(Admitted.class, join(runs.begin(designated(BLUE).build())));
         final List<Revocation> seen = revocations(held);
 
-        remove(Designations.keyOf(KEY));
+        remove(Designations.keyOf(Environment.DEFAULT, KEY));
 
         // An absent key is "nobody is designated", and that is what a candidate asking from scratch is
         // told. A run in flight has to be told the same thing, or who may run depends on when the run
@@ -814,7 +815,7 @@ class ExclusiveRunsTest {
         assertEquals(1, seen.size());
         assertEquals(Revocation.Reason.DESIGNATION_CHANGED, seen.get(0).reason());
         assertNull(seen.get(0).newOwner(), "Nobody takes over from a designation that was removed");
-        assertTrue(seen.get(0).detail().contains(Designations.keyOf(KEY)),
+        assertTrue(seen.get(0).detail().contains(Designations.keyOf(Environment.DEFAULT, KEY)),
                 "The revocation has to name the key, was: " + seen.get(0));
     }
 
@@ -869,7 +870,8 @@ class ExclusiveRunsTest {
         // run would first try to renew a minute later, and spend the fifty seconds in between believing
         // it owned work anybody else was free to take.
         final ExclusiveRequest request = elected(BLUE).renewalGrace(Duration.ofHours(1)).build();
-        join(store.tryAcquire(ExclusiveRuns.leaseKey(KEY), ExclusiveRuns.leaseOwner(request), LEASE));
+        join(store.tryAcquire(ExclusiveRuns.leaseKey(Environment.DEFAULT, KEY),
+                ExclusiveRuns.leaseOwner(request), LEASE));
         time.advance(LEASE.minusSeconds(10));
 
         final UnreachableStore flaky = new UnreachableStore(store);
@@ -924,7 +926,7 @@ class ExclusiveRunsTest {
     // ---- a guard which stops making sense ------------------------------------------------------
 
     static List<String> keysARunWatches() {
-        return List.of(Designations.keyOf(KEY), Switches.keyOf(KEY));
+        return List.of(Designations.keyOf(Environment.DEFAULT, KEY), Switches.keyOf(Environment.DEFAULT, KEY));
     }
 
     @ParameterizedTest
@@ -947,7 +949,9 @@ class ExclusiveRunsTest {
     }
 
     static List<String> keysAnAskReads() {
-        return List.of(Designations.keyOf(KEY), Switches.keyOf(KEY), Milestones.keyOf("data/euc1"));
+        return List.of(Designations.keyOf(Environment.DEFAULT, KEY),
+                Switches.keyOf(Environment.DEFAULT, KEY),
+                Milestones.keyOf(Environment.DEFAULT, "data/euc1"));
     }
 
     @ParameterizedTest
@@ -966,7 +970,7 @@ class ExclusiveRunsTest {
 
     @Test
     void doesNotParkOnAKeyNobodyCanRead() {
-        put(Designations.keyOf(KEY), "{\"owner\": ");
+        put(Designations.keyOf(Environment.DEFAULT, KEY), "{\"owner\": ");
 
         final CompletableFuture<Admission> asked = runs.begin(designated(BLUE)
                 .handoverWait(Duration.ofHours(4))
@@ -1091,7 +1095,7 @@ class ExclusiveRunsTest {
         final CoordinationStore moving = intercepting((proxy, method, args) -> {
             // Moved once the lease is held and the guards read, as the designation watch starts.
             if (method.getName().equals("awaitChange")
-                    && args[0].equals(ExclusiveRuns.designationKey(KEY))
+                    && args[0].equals(ExclusiveRuns.designationKey(Environment.DEFAULT, KEY))
                     && watches.getAndIncrement() == 0) {
                 designate(GREEN);
             }
@@ -1175,7 +1179,7 @@ class ExclusiveRunsTest {
     }
 
     static List<Outage> guardOutages() {
-        final String designation = Designations.keyOf(KEY);
+        final String designation = Designations.keyOf(Environment.DEFAULT, KEY);
         return List.of(
                 new Outage("Reads fail", store -> store.stopAnsweringReadsOf(designation)),
                 new Outage("Nothing is answered", store -> store.goSilentOn(designation)),
@@ -1212,7 +1216,7 @@ class ExclusiveRunsTest {
 
         assertFalse(held.isHeld(), "A run nothing can be learnt about must not keep running");
         assertEquals(Revocation.Reason.GUARD_UNREACHABLE, seen.get(0).reason());
-        assertTrue(seen.get(0).detail().contains(Designations.keyOf(KEY)),
+        assertTrue(seen.get(0).detail().contains(Designations.keyOf(Environment.DEFAULT, KEY)),
                 "The revocation has to name the key nobody could read, was: " + seen.get(0));
     }
 
@@ -1227,7 +1231,7 @@ class ExclusiveRunsTest {
 
         // The watch in flight answers, the next one and the read behind it fail, and the guard is left
         // waiting on the timer that paces its next attempt.
-        flaky.stopAnsweringReadsOf(Designations.keyOf(KEY));
+        flaky.stopAnsweringReadsOf(Designations.keyOf(Environment.DEFAULT, KEY));
         time.advance(Duration.ofSeconds(15));
         assertTrue(held.isHeld());
 
@@ -1298,7 +1302,7 @@ class ExclusiveRunsTest {
         flaky.answerWatchesAgain();
         time.advance(LEASE);
         if (reason == Revocation.Reason.DISABLED) {
-            put(ExclusiveRuns.switchKey(KEY), new Switch(false, "incident 4711", null).toJson());
+            put(ExclusiveRuns.switchKey(Environment.DEFAULT, KEY), new Switch(false, "incident 4711", null).toJson());
         } else {
             designate(GREEN);
         }
@@ -1361,7 +1365,7 @@ class ExclusiveRunsTest {
 
         assertFalse(held.isHeld(), "A guard which can no longer be re-armed is not a guard");
         assertEquals(Revocation.Reason.GUARD_UNREACHABLE, seen.get(0).reason());
-        assertTrue(seen.get(0).detail().contains(Designations.keyOf(KEY)), seen.get(0).detail());
+        assertTrue(seen.get(0).detail().contains(Designations.keyOf(Environment.DEFAULT, KEY)), seen.get(0).detail());
     }
 
     @Test
@@ -1584,7 +1588,8 @@ class ExclusiveRunsTest {
      */
     private CoordinationStore publishingAfter(final CompletableFuture<Void> gate) {
         return intercepting((proxy, method, args) -> {
-            if (method.getName().equals("compareAndSet") && args[0].equals(Milestones.keyOf("data/euc1"))) {
+            if (method.getName().equals("compareAndSet")
+                    && args[0].equals(Milestones.keyOf(Environment.DEFAULT, "data/euc1"))) {
                 return gate.thenCompose(ignored -> store.compareAndSet(
                         (String) args[0], (String) args[1], (String) args[2]));
             }

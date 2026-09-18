@@ -35,31 +35,44 @@ when a value changes away and back: the state in force matters, not an intermedi
 ### Stored keys
 
 Every name used by a run or an operator maps to its own discas key. Different kinds of names map to
-different keys, even when the names are equal. Examples use the quick start names.
+different keys, even when the names are equal. Examples use the quick start names and the `prod`
+environment.
+
+Every key piplex writes is `piplex/<environment>/<kind>/<name>`. The environment segment is what lets
+one cluster serve several sets of orchestrations: `prod` and `uat` share no milestone, no switch, no
+designation and no lease, even where every name in them is the same. It is set once per controller in
+Manage Jenkins > System and may be overridden per step; a controller which names none works in
+`default`.
 
 | Name in piplex | discas key | Example | Read by | Written by |
 |---|---|---|---|---|
-| `key` of `piplexExclusive` / `ExclusiveRequest` | `piplex/exclusive/<key>` | `piplex/exclusive/eod` | The run | The run: acquire, renew, release |
-| `designatedBy` | `piplex/designated/<designatedBy>` | `piplex/designated/eod-owner` | Runs; watched while parked or admitted | Operator: `designate`, `repair` |
-| `enabledBy` | `piplex/enabled/<enabledBy>` | `piplex/enabled/eod-switch` | Runs; watched while parked or admitted | Operator: `disable`, `enable`, `repair` |
-| `enabledBy` plus the controller's `ownerId` | `piplex/enabled/<enabledBy>/@<ownerId>` | `piplex/enabled/eod-switch/@euc1-blue` | Runs of that owner; watched while parked or admitted | Operator: `disable('eod-switch/@euc1-blue', ...)` |
+| `key` of `piplexExclusive` / `ExclusiveRequest` | `piplex/<environment>/exclusive/<key>` | `piplex/prod/exclusive/eod` | The run | The run: acquire, renew, release |
+| `designatedBy` | `piplex/<environment>/designated/<designatedBy>` | `piplex/prod/designated/eod-owner` | Runs; watched while parked or admitted | Operator: `designate`, `repair` |
+| `enabledBy` | `piplex/<environment>/enabled/<enabledBy>` | `piplex/prod/enabled/eod-switch` | Runs; watched while parked or admitted | Operator: `disable`, `enable`, `repair` |
+| `enabledBy` plus the controller's `ownerId` | `piplex/<environment>/enabled/<enabledBy>/@<ownerId>` | `piplex/prod/enabled/eod-switch/@euc1-blue` | Runs of that owner; watched while parked or admitted | Operator: `disable('eod-switch/@euc1-blue', ...)` |
 | `activeKey` / `activeWhenKey` | `<activeKey>`, as is | `/dc/active` | Runs; watched while parked or admitted | External system only |
-| `completedWhen` | `piplex/milestone/<completedWhen>` | `piplex/milestone/data/euc1` | Runs; watched while parked | Producer, see the next row |
-| `key` of `piplexPublish` / `publish` | `piplex/milestone/<key>` | `piplex/milestone/data/euc1` | Producer, before its compare-and-set | Producer; operator `repair` |
-| `key` of `piplexAwait` / `awaitAtLeast` | `piplex/milestone/<key>` | `piplex/milestone/data/euc1` | Consumer, watched | Producer, see the previous row |
-| Jenkins `ownerId` | `piplex/instances/<ownerId>` | `piplex/instances/euc1-blue` | The same controller | The controller, every 30 seconds |
+| `completedWhen` | `piplex/<environment>/milestone/<completedWhen>` | `piplex/prod/milestone/data/euc1` | Runs; watched while parked | Producer, see the next row |
+| `key` of `piplexPublish` / `publish` | `piplex/<environment>/milestone/<key>` | `piplex/prod/milestone/data/euc1` | Producer, before its compare-and-set | Producer; operator `repair` |
+| `key` of `piplexAwait` / `awaitAtLeast` | `piplex/<environment>/milestone/<key>` | `piplex/prod/milestone/data/euc1` | Consumer, watched | Producer, see the previous row |
+| Jenkins `ownerId` | `piplex/<environment>/instances/<ownerId>` | `piplex/prod/instances/euc1-blue` | The same controller | The controller, every 30 seconds |
 
 Other properties are not keys:
 
+- `environment` is a segment of every key above, not a key of its own;
 - `generation` is compared with the `generation` field inside the milestone record;
 - `ownerId`, `runId` and `executionId` name the lease holder; the lease record keeps that name, the
   fencing token and the `lease` term;
 - `renewEvery`, `renewalGrace`, `guardGrace`, `handoverWait` and `timeout` are local timings.
 
-The active key is the only key outside `piplex/`. Its value is a plain string, not JSON, and piplex
-never writes it.
+The active key is the only key outside `piplex/`, in any environment. Its value is a plain string,
+not JSON, and piplex never writes it. It is not given an environment segment either: it belongs to
+the external system that writes it, which separates its own environments however it already does.
 
-`piplex/instances/` is not work state, but its prefix must be included in Jenkins ACLs.
+`piplex/<environment>/instances/` is not work state, but its prefix must be included in Jenkins
+ACLs. The heartbeat is written in the controller's own default environment, never a step's: it says
+which process is using an owner id, and a controller has one identity however many environments its
+jobs run in. Two controllers sharing an owner id in different environments are therefore two
+deployments rather than one duplicated, and no warning is raised.
 
 The designation, switch and milestone records are JSON intended for inspection. The exclusive key is
 a store-native lock record and must never be edited by hand.

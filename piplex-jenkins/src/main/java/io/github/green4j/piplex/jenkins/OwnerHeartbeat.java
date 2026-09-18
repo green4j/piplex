@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.jenkins;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.store.CoordinationStore;
 import io.github.green4j.piplex.store.FailFastStore;
@@ -38,13 +39,14 @@ final class OwnerHeartbeat {
     /** How long beats may keep failing to write before the check itself is reported as not working. */
     static final Duration SILENT_AFTER = Duration.ofMinutes(5);
 
-    private static final String PREFIX = "piplex/instances/";
+    private static final String KIND = "instances";
 
     private final String mark = UUID.randomUUID().toString();
     private final TimeSource time;
 
     // Guarded by this.
     private String ownerId;
+    private Environment environment;
     private boolean written;
     private boolean seen;
     private long seenAtNanos;
@@ -60,28 +62,32 @@ final class OwnerHeartbeat {
         this.time = time;
     }
 
-    static String keyOf(final String ownerId) {
-        return PREFIX + ownerId;
+    static String keyOf(final Environment environment, final String ownerId) {
+        return environment.prefixOf(KIND) + ownerId;
     }
 
     /**
      * Reads the key, notes a mark that is not this process's, and writes this one.
      *
      * @param store   where the key is
+     * @param in       the controller's own environment, which is the one its mark goes in
      * @param current the owner id in force now
      * @return completes once the beat is over; never exceptionally
      */
-    CompletionStage<Void> tick(final CoordinationStore store, final String current) {
+    CompletionStage<Void> tick(final CoordinationStore store, final Environment in, final String current) {
         synchronized (this) {
-            if (!current.equals(ownerId)) {
-                // A new owner id is a new key: nothing written there yet, and nothing seen.
+            if (!current.equals(ownerId) || !in.equals(environment)) {
+                // A new owner id is a new key, and so is a new environment: nothing written there yet,
+                // and nothing seen. Two controllers sharing an owner id in different environments are
+                // two deployments, not one duplicated -- which is the whole point of the segment.
                 ownerId = current;
+                environment = in;
                 written = false;
                 seen = false;
             }
         }
         final CoordinationStore failFast = FailFastStore.of(store, time);
-        final String key = keyOf(current);
+        final String key = keyOf(in, current);
         return failFast.get(key)
                 .thenCompose(entry -> {
                     synchronized (this) {
@@ -96,13 +102,13 @@ final class OwnerHeartbeat {
                 .handle((swapped, error) -> {
                     // A lost compare is somebody else's write, which the next beat reads; a failure is a
                     // store the next beat asks again. Either way, one that never ends is reported.
-                    wrote(current, Boolean.TRUE.equals(swapped));
+                    wrote(in, current, Boolean.TRUE.equals(swapped));
                     return (Void) null;
                 });
     }
 
-    private synchronized void wrote(final String current, final boolean swapped) {
-        if (!current.equals(ownerId)) {
+    private synchronized void wrote(final Environment in, final String current, final boolean swapped) {
+        if (!current.equals(ownerId) || !in.equals(environment)) {
             return;
         }
         if (swapped) {

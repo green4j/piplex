@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.exclusive;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.ManualTime;
 import io.github.green4j.piplex.store.CoordinationStore;
 import io.github.green4j.piplex.store.memory.InMemoryCoordinationStore;
@@ -99,12 +100,13 @@ class DesignationsTest {
     }
 
     private String version() {
-        return join(store.get(Designations.keyOf(KEY))).version();
+        return join(store.get(Designations.keyOf(Environment.DEFAULT, KEY))).version();
     }
 
     @Test
     void repairsAValueThatWillNotParse() {
-        join(store.compareAndSet(Designations.keyOf(KEY), CoordinationStore.INITIAL_VERSION, "{\"owner\""));
+        join(store.compareAndSet(Designations.keyOf(Environment.DEFAULT, KEY),
+                CoordinationStore.INITIAL_VERSION, "{\"owner\""));
 
         final DesignationChange repaired = join(designations.repair(KEY, BLUE, "INC-4821"));
 
@@ -125,8 +127,8 @@ class DesignationsTest {
         join(logged.designate(KEY, GREEN, "INC-4821"));
 
         assertEquals(List.of(
-                "DESIGNATED key=eod owner=euc1-blue reason=\"initial setup\"",
-                "DESIGNATED key=eod owner=euc1-green previous=euc1-blue reason=INC-4821"), lines);
+                "DESIGNATED environment=default key=eod owner=euc1-blue reason=\"initial setup\"",
+                "DESIGNATED environment=default key=eod owner=euc1-green previous=euc1-blue reason=INC-4821"), lines);
     }
 
     private static <T> T join(final CompletionStage<T> stage) {

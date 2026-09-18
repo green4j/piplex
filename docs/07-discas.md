@@ -11,7 +11,7 @@ distinguish a free key from one held by an unnamed owner.
 
 | Property | Requirement |
 |---|---|
-| Prefix | `piplex/` |
+| Prefix | `piplex/<environment>/` |
 | Operations | `GET` and `CAS` |
 | Values | Small JSON and lock records |
 | Writes | Usually a few per run or operator action |
@@ -45,6 +45,23 @@ Use `--members-file` when membership must be reloaded. Health and metrics use
 
 Every option also has a `DISCAS_*` environment variable. Flags override environment values, which
 override defaults.
+
+### Environments and cluster ids
+
+Two things separate work on a discas deployment, and they are not the same thing.
+
+`--cluster-id` names a cluster. Nodes of one consensus group share it, and a client which connects
+with the wrong one is talking to the wrong cluster. Separating environments this way means separate
+nodes, separate WALs and separate quorums -- correct, and the right answer where the environments
+must not share a failure domain, but it is a second deployment to run.
+
+The `environment` setting names a segment of every key piplex writes, inside one cluster. It costs
+nothing to run and ACLs can enforce it, and the trade is the one sharing always makes: a lost quorum
+takes every environment on that cluster with it.
+
+Use cluster ids where an outage must not be shared, and the environment segment where the cluster is
+shared deliberately. Naming the cluster after the environment and stopping there separates nothing:
+two controllers on one cluster still need the segment.
 
 ### Security profiles
 
@@ -105,30 +122,36 @@ acl.<clientId> = <prefix>:<OPS> ; <prefix>:<OPS>
 Piplex needs `G` (GET, including watches) and `C` (CAS, including leases):
 
 ```text
-acl.piplex-euc1-blue  = piplex/:GC
-acl.piplex-euc1-green = piplex/:GC
+acl.piplex-euc1-blue  = piplex/prod/:GC
+acl.piplex-euc1-green = piplex/prod/:GC
 ```
 
 It does not need `P`, `D` or `S`.
 
+Because the environment is a key prefix, one grant per environment is all the separation a shared
+cluster needs: a controller granted `piplex/prod/:GC` cannot read or write uat's keys, whatever a job
+on it names in a step. Grant `piplex/:GC` instead and that separation is gone -- which is the right
+choice only where the environments are not a trust boundary.
+
 An `activeWhenKey` lies outside `piplex/`, so grant `G` on it separately:
 
 ```text
-acl.piplex-euc1-blue = piplex/:GC ; /dc/active:G
+acl.piplex-euc1-blue = piplex/prod/:GC ; /dc/active:G
 ```
 
 To separate operational writes from controllers, grant the keys listed in
 [Stored keys](01-model.md#stored-keys):
 
 ```text
-acl.piplex-euc1-blue = piplex/designated/eod-owner:G ; piplex/enabled/eod-switch:G ; piplex/milestone/data/euc1:GC ; piplex/exclusive/eod:GC ; piplex/instances/euc1-blue:GC
-acl.piplex-ops = piplex/designated/:GC ; piplex/enabled/:GC
+acl.piplex-euc1-blue = piplex/prod/designated/eod-owner:G ; piplex/prod/enabled/eod-switch:G ; piplex/prod/milestone/data/euc1:GC ; piplex/prod/exclusive/eod:GC ; piplex/prod/instances/euc1-blue:GC
+acl.piplex-ops = piplex/prod/designated/:GC ; piplex/prod/enabled/:GC
 ```
 
-The heartbeat grant is required for duplicate-owner detection. Under this split, designation and
-switch procedures cannot use the controller's Script Console because it connects as the controller;
-run them through the separately authenticated operations client. If that separation is unnecessary,
-grant controllers `piplex/:GC`.
+The heartbeat grant is required for duplicate-owner detection, and it is the controller's own
+environment that has to be granted -- the heartbeat is written there whatever environments its jobs
+name. Under this split, designation and switch procedures cannot use the controller's Script Console
+because it connects as the controller; run them through the separately authenticated operations
+client. If that separation is unnecessary, grant controllers `piplex/prod/:GC`.
 
 Authentication does not enable audit by itself. Configure `--audit-config-file` and reload it with
 `POST /reload`. Audit records in `allowall` identify only a claimed client id.
@@ -187,7 +210,8 @@ bound also covers a client deadline of up to 75 seconds.
 - Distinct controller `ownerId`, `clientId` and, under mTLS, matching certificate CN.
 - Token with TLS and no client key store, or mTLS with no token.
 - Node identity verification enabled, or node certificates explicitly pinned.
-- ACL grants include `piplex/instances/` when narrowed by prefix.
+- ACL grants include `piplex/<environment>/instances/` when narrowed by prefix.
+- One ACL grant per environment where a cluster is shared and the environments are a trust boundary.
 - ACL grants include `G` on every `activeWhenKey`.
 - Client and nodes run exactly the same discas version.
 - Certificate, membership and ACL reload is automated.

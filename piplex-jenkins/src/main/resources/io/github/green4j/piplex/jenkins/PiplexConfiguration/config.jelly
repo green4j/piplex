@@ -9,6 +9,11 @@
              description="The identity this controller connects to discas under. Leave empty to use the controller's id. One identity per controller, so that access rules and the store's own audit can tell them apart.">
       <f:textbox/>
     </f:entry>
+    <f:entry title="Default environment" field="environment"
+             description="Which set of orchestrations this controller's work belongs to, e.g. prod or uat. It is a segment of every key piplex writes, so two environments on one cluster do not share a milestone, a switch, a designation or a lease. Leave empty for &quot;default&quot;. A step may name another one; this is what the ones that do not get.">
+      <f:textbox default="default"/>
+    </f:entry>
+
     <f:entry title="discas nodes" field="nodes"
              description="One nodeId=host:port per line, for every node of the cluster.">
       <f:textarea/>

@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.observe;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.exclusive.Revocation;
 
@@ -16,15 +17,17 @@ import java.util.function.Consumer;
 /**
  * Writes the event vocabulary as one line per decision, in a shape an aggregator can group.
  *
- * <p>Every line carries {@code key}, and every line about a run carries {@code generation} with it:
- * that pair is the correlation key, and one day's attempt at one key gathers under it across every
- * controller -- the one which ran and the ones which waited -- with nothing to join on. A line about
- * waiting for a milestone names the generation it wanted rather than one it is at, so it says
- * {@code wanted} and {@code reached}; the key is spelt the same way everywhere.
+ * <p>Every line carries {@code environment} and {@code key}, and every line about a run carries
+ * {@code generation} with them: those three are the correlation key, and one day's attempt at one key
+ * gathers under them across every controller -- the one which ran and the ones which waited -- with
+ * nothing to join on. The environment is on every line because one controller may run the same key in
+ * several of them, and two such lines are otherwise indistinguishable. A line about waiting for a
+ * milestone names the generation it wanted rather than one it is at, so it says {@code wanted} and
+ * {@code reached}; the key is spelt the same way everywhere.
  *
  * <pre>
- * ADMITTED key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 fencingToken=47
- * PARKED   key=eod generation=2026-09-12 owner=eus1-blue run=eod#88 waitingOn=euc1-blue remaining=PT4H
+ * ADMITTED environment=prod key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 fencingToken=47
+ * PARKED   environment=prod key=eod generation=2026-09-12 owner=eus1-blue run=eod#88 waitingOn=euc1-blue remaining=PT4H
  * </pre>
  */
 public final class TextPiplexObserver implements PiplexObserver {
@@ -104,55 +107,63 @@ public final class TextPiplexObserver implements PiplexObserver {
     }
 
     @Override
-    public void milestoneReached(final String milestone, final Generation reached) {
-        emit(new Line("MILESTONE_REACHED").put("key", milestone).put("reached", reached));
+    public void milestoneReached(final Environment environment,
+                                 final String milestone,
+                                 final Generation reached) {
+        emit(line("MILESTONE_REACHED", environment, milestone).put("reached", reached));
     }
 
     @Override
-    public void milestoneWaiting(final String milestone,
+    public void milestoneWaiting(final Environment environment,
+                                 final String milestone,
                                  final Generation wanted,
                                  final Generation reached,
                                  final Duration giveUpAfter) {
-        emit(new Line("MILESTONE_WAITING")
-                .put("key", milestone)
+        emit(line("MILESTONE_WAITING", environment, milestone)
                 .put("wanted", wanted)
                 .put("reached", reached)
                 .put("giveUpAfter", giveUpAfter));
     }
 
     @Override
-    public void milestoneTimedOut(final String milestone,
+    public void milestoneTimedOut(final Environment environment,
+                                  final String milestone,
                                   final Generation wanted,
                                   final Generation reached) {
-        emit(new Line("MILESTONE_TIMED_OUT")
-                .put("key", milestone)
+        emit(line("MILESTONE_TIMED_OUT", environment, milestone)
                 .put("wanted", wanted)
                 .put("reached", reached));
     }
 
     @Override
-    public void designated(final String key,
+    public void designated(final Environment environment,
+                           final String key,
                            final String owner,
                            final String previous,
                            final String reason) {
-        emit(new Line("DESIGNATED")
-                .put("key", key)
+        emit(line("DESIGNATED", environment, key)
                 .put("owner", owner)
                 .put("previous", previous)
                 .put("reason", reason));
     }
 
     @Override
-    public void switched(final String key, final boolean enabled, final String reason) {
-        emit(new Line("SWITCHED").put("key", key).put("enabled", enabled).put("reason", reason));
+    public void switched(final Environment environment,
+                         final String key,
+                         final boolean enabled,
+                         final String reason) {
+        emit(line("SWITCHED", environment, key).put("enabled", enabled).put("reason", reason));
     }
 
     private static Line line(final String event, final RunRef run) {
-        return new Line(event)
-                .put("key", run.key())
+        return line(event, run.environment(), run.key())
                 .put("generation", run.generation())
                 .put("owner", run.ownerId())
                 .put("run", run.runId());
+    }
+
+    private static Line line(final String event, final Environment environment, final String key) {
+        return new Line(event).put("environment", environment).put("key", key);
     }
 
     private void emit(final Line line) {

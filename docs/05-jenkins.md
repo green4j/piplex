@@ -13,6 +13,7 @@ Open **Manage Jenkins > System > piplex**.
 |---|---|
 | `ownerId` | Stable identity named by designations; unique per controller |
 | `clientId` | Identity presented to discas; defaults to `ownerId` |
+| `environment` | Which set of orchestrations this controller's work belongs to; blank means `default` |
 | `nodes` | Comma- or whitespace-separated `nodeId=host:port` entries |
 | `token` | Shared token for discas token authentication |
 | `tls` | Encrypt and authenticate the server connection |
@@ -70,8 +71,10 @@ A successful Save closes the previous store. Runs using it stop renewing and are
 safe deadline is reached; the scheduler remains alive so those failures are observed. Change settings
 when no guarded work is running, or accept that revocation.
 
-The controller also writes `piplex/instances/<ownerId>` every 30 seconds. Seeing another process mark
-under the same owner activates an administrative warning and logs a warning in builds.
+The controller also writes `piplex/<environment>/instances/<ownerId>` every 30 seconds, in its own
+default environment. Seeing another process mark under the same owner activates an administrative
+warning and logs a warning in builds. Two controllers sharing an owner id in different environments
+are two deployments rather than one duplicated, and are not reported.
 
 ### `piplexExclusive`
 
@@ -108,6 +111,7 @@ a wrapper.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `key` | required | Resource being protected |
+| `environment` | controller default | Which set of orchestrations this work belongs to |
 | `designatedBy` | unset | Designation key; unset elects |
 | `generation` | unset | Work generation |
 | `completedWhen` | unset | Milestone that makes the generation unnecessary |
@@ -200,6 +204,28 @@ flight. Only downstream fencing can make writes in that interval harmless.
 When Jenkins stops, the plugin abandons admissions without releasing them. Renewals cease and leases
 lapse; a quick restart can recover the same lease and token.
 
+### Environments
+
+Every key a step reads or writes is under `piplex/<environment>/`, so two environments on one cluster
+share no milestone, switch, designation or lease. The controller's own setting is what steps get
+unless they name another:
+
+```groovy
+// Reads and writes piplex/uat/..., on a controller whose default is prod
+piplexExclusive(key: 'eod', environment: 'uat', designatedBy: 'eod') { ... }
+```
+
+Name it per step where one controller serves several environments -- the same job, parameterised by
+the environment it is deploying. Leave it alone where a controller serves one: that is what the
+controller-wide setting is for, and repeating it in every Jenkinsfile is a chance to get it wrong.
+
+An `environment` must not contain `/`, because that is the separator between it and the kind of
+record. A step that names one which cannot be an environment fails with that said, before it asks
+for anything.
+
+It is unrelated to Declarative Pipeline's own `environment { }` block, which sets environment
+variables for the build and has nothing to do with keys.
+
 ### Fencing token
 
 Fencing is optional. The guarded work need not know about piplex.
@@ -229,8 +255,9 @@ Neither form protects anything unless the target resource rejects stale tokens.
 ```groovy
 // Records that the date is produced. Goal: announce the result.
 // Effect: waiting consumers continue; builds with completedWhen for the date skip
-piplexPublish key: 'data/euc1',                // Milestone to raise
-              generation: params.BUSINESS_DATE // Generation just produced
+piplexPublish key: 'data/euc1',                 // Milestone to raise
+              generation: params.BUSINESS_DATE, // Generation just produced
+              environment: 'prod'              // Optional; the controller's default otherwise
 ```
 
 Publish only after successful work. The step returns the generation in force. A restart repeats the
@@ -251,6 +278,7 @@ piplexAwait key: 'data/euc1',                 // Milestone to watch
 |---|---|---|
 | `key` | required | Milestone to read |
 | `generation` | required | Minimum generation needed |
+| `environment` | controller default | Which set of orchestrations to read it in |
 | `timeout` | `1h` | Maximum wait for this controller session |
 | `skipOnTimeout` | `false` | Return `NOT_BUILT` instead of `FAILURE` on timeout |
 

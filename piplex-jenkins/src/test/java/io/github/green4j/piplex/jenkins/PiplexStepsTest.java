@@ -11,6 +11,7 @@ import hudson.AbortException;
 import hudson.ExtensionList;
 import hudson.model.Result;
 import hudson.model.TaskListener;
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.exclusive.Admission;
@@ -92,7 +93,7 @@ class PiplexStepsTest {
 
         jenkins.assertBuildStatus(Result.SUCCESS, run);
         jenkins.assertLogContains("end of day ran here", run);
-        jenkins.assertLogContains("piplex: ADMITTED key=eod", run);
+        jenkins.assertLogContains("piplex: ADMITTED environment=default key=eod", run);
     }
 
     @Test
@@ -479,7 +480,7 @@ class PiplexStepsTest {
                 """);
 
         jenkins.assertBuildStatus(Result.NOT_BUILT, run);
-        jenkins.assertLogContains("piplex: CONTENDED key=eod", run);
+        jenkins.assertLogContains("piplex: CONTENDED environment=default key=eod", run);
         jenkins.assertLogContains("nobody is holding it", run);
         jenkins.assertLogNotContains("'null'", run);
     }
@@ -524,7 +525,7 @@ class PiplexStepsTest {
         configuration.beatNow().toCompletableFuture().get(10L, TimeUnit.SECONDS);
 
         // A clone writes its own mark under the same owner id.
-        final String key = OwnerHeartbeat.keyOf("euc1-blue");
+        final String key = OwnerHeartbeat.keyOf(Environment.DEFAULT, "euc1-blue");
         final Entry mine = store.get(key).toCompletableFuture().get(10L, TimeUnit.SECONDS);
         assertTrue(store.compareAndSet(key, mine.version(), "a-clone")
                 .toCompletableFuture().get(10L, TimeUnit.SECONDS));
@@ -577,7 +578,7 @@ class PiplexStepsTest {
         // And the block which does hold it ran to the end and gave the lease back itself, rather than
         // being revoked half way through by the other one letting go of a lease they were sharing.
         jenkins.assertLogContains("and it still holds it", run);
-        jenkins.assertLogContains("piplex: RELEASED key=eod", run);
+        jenkins.assertLogContains("piplex: RELEASED environment=default key=eod", run);
         jenkins.assertLogNotContains("piplex: REVOKED", run);
     }
 
@@ -637,7 +638,7 @@ class PiplexStepsTest {
     @Test
     void keepsTheLeaseUntilAMilestoneOnItsWayWhenStoppedHasLanded(final JenkinsRule jenkins) throws Exception {
         PiplexConfiguration.get().setOwnerId("euc1-blue");
-        final String milestone = Milestones.keyOf("data/euc1");
+        final String milestone = Milestones.keyOf(Environment.DEFAULT, "data/euc1");
         final CompletableFuture<Void> publishAsked = new CompletableFuture<>();
         final CompletableFuture<Void> gate = new CompletableFuture<>();
         final AtomicBoolean published = new AtomicBoolean();
@@ -706,7 +707,7 @@ class PiplexStepsTest {
     @Test
     void stopsWaitingForAMilestoneWhenTheBuildIsStopped(final JenkinsRule jenkins) throws Exception {
         PiplexConfiguration.get().setOwnerId("eus1-blue");
-        final String key = Milestones.keyOf("data/euc1");
+        final String key = Milestones.keyOf(Environment.DEFAULT, "data/euc1");
         final AtomicInteger reads = new AtomicInteger();
         PiplexConfiguration.useStore((CoordinationStore) Proxy.newProxyInstance(
                 getClass().getClassLoader(), new Class<?>[] {CoordinationStore.class},
@@ -749,10 +750,68 @@ class PiplexStepsTest {
         jenkins.assertLogContains("waited for 'data/euc1' to reach 2026-09-12", run);
     }
 
+    @Test
+    void takesTheEnvironmentAStepNamesRatherThanTheControllersDefault(final JenkinsRule jenkins)
+            throws Exception {
+        configure("euc1-blue");
+        // Designated in the controller's default environment only, so a step which names uat must not
+        // see it: the whole point of the segment is that these are two different designations.
+        designate("euc1-blue");
+
+        final WorkflowRun run = build(jenkins, "eod-uat", """
+                node {
+                    piplexExclusive(key: 'eod', environment: 'uat', designatedBy: 'eod',
+                                    generation: '2026-09-12') {
+                        echo 'ran in uat'
+                    }
+                }
+                """);
+
+        jenkins.assertBuildStatus(Result.NOT_BUILT, run);
+        jenkins.assertLogContains("piplex: NOT_DESIGNATED environment=uat key=eod", run);
+    }
+
+    @Test
+    void publishesTheMilestoneInTheEnvironmentTheStepNamed(final JenkinsRule jenkins) throws Exception {
+        configure("euc1-blue");
+
+        final WorkflowRun run = build(jenkins, "publish-uat", """
+                node {
+                    piplexPublish key: 'data/euc1', generation: '2026-09-12', environment: 'uat'
+                }
+                """);
+
+        jenkins.assertBuildStatus(Result.SUCCESS, run);
+        assertTrue(entry(Milestones.keyOf(Environment.of("uat"), "data/euc1")).exists(),
+                "The milestone belongs to the environment the step named");
+        assertFalse(entry(Milestones.keyOf(Environment.DEFAULT, "data/euc1")).exists(),
+                "and must not also appear in the controller's default one");
+    }
+
+    @Test
+    void refusesAnEnvironmentAStepCannotHave(final JenkinsRule jenkins) throws Exception {
+        configure("euc1-blue");
+
+        final WorkflowRun run = build(jenkins, "eod-bad-env", """
+                node {
+                    piplexExclusive(key: 'eod', environment: 'team/blue') {
+                        echo 'never runs'
+                    }
+                }
+                """);
+
+        jenkins.assertBuildStatus(Result.FAILURE, run);
+        jenkins.assertLogContains("must not contain '/'", run);
+    }
+
     private void configure(final String ownerId) {
         final PiplexConfiguration configuration = PiplexConfiguration.get();
         configuration.setOwnerId(ownerId);
         PiplexConfiguration.useStore(store, time);
+    }
+
+    private Entry entry(final String key) throws Exception {
+        return store.get(key).toCompletableFuture().get(10L, TimeUnit.SECONDS);
     }
 
     private void designate(final String owner) throws Exception {
@@ -900,7 +959,8 @@ class PiplexStepsTest {
         @Override
         public CompletionStage<Entry> get(final String key) {
             final CompletionStage<Entry> read = delegate.get(key);
-            if (acquired.get() && key.equals(Designations.keyOf("eod")) && moved.compareAndSet(false, true)) {
+            if (acquired.get() && key.equals(Designations.keyOf(Environment.DEFAULT, "eod"))
+                    && moved.compareAndSet(false, true)) {
                 new Designations(delegate, time)
                         .designate("eod", "eus1-blue", "the moment in between")
                         .toCompletableFuture().join();

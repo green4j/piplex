@@ -13,6 +13,18 @@ upgrade and rollback operational procedures.
 | Cluster outage | New admission fails; holders stop by grace or lease term | Preserved if cluster recovers |
 | Plugin/client and node version mismatch | Connection handshake fails | Preserved |
 | Store loss or rewind | Holders and fencing sequence are lost | Must be reconstructed |
+| Environment setting changed | Runs are revoked as by any Save | Preserved, and no longer read: every key moves |
+
+### Change a controller's environment
+
+The environment is a segment of every key, so changing it does not move state -- it stops reading the
+state that is there and starts on keys nobody has written. Designations, switches and milestones in
+the old environment stay where they are, and a job comparing generations finds nothing published.
+
+Treat it as a migration rather than a setting: drain the work, copy or re-establish the designation,
+switch and milestone records under the new environment, then let the work run. Two controllers
+competing for one key must be changed together; while one has moved and the other has not they are
+looking at different keys and both may run.
 
 ### Upgrade the plugin
 
@@ -58,7 +70,7 @@ present: `owner`, `enabled` and `generation`. Unknown provenance is ignored. Ope
 roll back automatically.
 
 A lease left by the removed process lapses within its configured term. Do not edit
-`piplex/exclusive/<key>` to accelerate it.
+`piplex/<environment>/exclusive/<key>` to accelerate it.
 
 #### Compatibility with older key formats
 

@@ -92,6 +92,9 @@ final class ExclusiveStepExecution extends StepExecution {
     private static final Set<ExclusiveStepExecution> IN_FLIGHT = ConcurrentHashMap.newKeySet();
 
     private final String key;
+    // Null means the controller's default. Written down with the rest, so a step resumed after a
+    // restart comes back in the environment it was admitted in rather than today's default.
+    private final String environment;
     private final String executionId;
     private final String ownershipId;
     private final String designatedBy;
@@ -182,6 +185,7 @@ final class ExclusiveStepExecution extends StepExecution {
     ExclusiveStepExecution(final StepContext context, final PiplexExclusiveStep step) throws Exception {
         super(context);
         this.key = step.getKey();
+        this.environment = step.getEnvironment();
         this.executionId = executionIdOf(context);
         this.ownershipId = context.get(Run.class).getExternalizableId() + '/' + executionId;
         this.designatedBy = step.getDesignatedBy();
@@ -313,7 +317,8 @@ final class ExclusiveStepExecution extends StepExecution {
         // Both from one reading of the settings, or a Save landing between two asks would give this
         // request the old owner id and a store built from the new form.
         final PiplexConfiguration configuration = PiplexConfiguration.require();
-        final PiplexConfiguration.Configured configured = configuration.configuredFor(listener);
+        final PiplexConfiguration.Configured configured =
+                configuration.configuredFor(listener, environment);
         final String duplicated = configuration.duplicatedOwner();
         if (duplicated != null) {
             listener.getLogger().println("piplex: WARNING another live controller uses the owner id '"

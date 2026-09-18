@@ -12,7 +12,7 @@ handover, a drain and a cross-controller milestone.
 | [4. Switches](04-switches.md) | Disable all work or drain one owner |
 | [5. Jenkins](05-jenkins.md) | Configure the plugin and use its four Pipeline steps |
 | [6. Operations](06-operations.md) | Run handovers, diagnose failures and size watches |
-| [7. discas and security](07-discas.md) | Configure the cluster, TLS and ACLs |
+| [7. discas and security](07-discas.md) | Configure the cluster, TLS, ACLs and environments |
 | [8. Lifecycle](08-lifecycle.md) | Upgrade, roll back and recover |
 
 ### Architecture

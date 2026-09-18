@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.observe;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.exclusive.Revocation;
 import org.junit.jupiter.api.Test;
@@ -26,7 +27,7 @@ import static org.junit.jupiter.params.provider.Arguments.arguments;
 class TextPiplexObserverTest {
 
     private static final RunRef RUN =
-            new RunRef("eod", Generation.of("2026-09-12"), "euc1-blue", "eod#142");
+            new RunRef(Environment.DEFAULT, "eod", Generation.of("2026-09-12"), "euc1-blue", "eod#142");
 
     private final List<String> lines = new ArrayList<>();
     private final TextPiplexObserver observer = new TextPiplexObserver(lines::add);
@@ -35,20 +36,22 @@ class TextPiplexObserverTest {
     void writesOneFieldPerThingWorthKnowing() {
         observer.admitted(RUN, 47L);
 
-        assertEquals("ADMITTED key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 fencingToken=47",
+        assertEquals("ADMITTED environment=default key=eod generation=2026-09-12 owner=euc1-blue "
+                        + "run=eod#142 fencingToken=47",
                 lines.get(0));
     }
 
     @Test
     void spellsTheKeyTheSameWayOnEveryLine() {
         observer.milestonePublished(RUN);
-        observer.milestoneReached("data/euc1", Generation.of("2026-09-12"));
+        observer.milestoneReached(Environment.DEFAULT, "data/euc1", Generation.of("2026-09-12"));
 
         // The correlation key is what an aggregator groups on, so it is one field name everywhere: the
         // run which published and the run which was waiting have to gather under the same thing.
-        assertEquals("MILESTONE_PUBLISHED key=eod generation=2026-09-12 owner=euc1-blue run=eod#142",
+        assertEquals("MILESTONE_PUBLISHED environment=default key=eod generation=2026-09-12 "
+                        + "owner=euc1-blue run=eod#142",
                 lines.get(0));
-        assertEquals("MILESTONE_REACHED key=data/euc1 reached=2026-09-12", lines.get(1));
+        assertEquals("MILESTONE_REACHED environment=default key=data/euc1 reached=2026-09-12", lines.get(1));
     }
 
     @Test
@@ -57,7 +60,7 @@ class TextPiplexObserverTest {
 
         // Absent, not "newOwner=null": an aggregator can filter on a field that is not there, while a
         // literal null is a value it has to learn to ignore.
-        assertEquals("REVOKED key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
+        assertEquals("REVOKED environment=default key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
                 + "reason=LEASE_LOST", lines.get(0));
     }
 
@@ -66,9 +69,9 @@ class TextPiplexObserverTest {
         observer.notActive(RUN, "/dc/active", "euc2-blue");
         observer.notActive(RUN, "/dc/active", null);
 
-        assertEquals("NOT_ACTIVE key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
+        assertEquals("NOT_ACTIVE environment=default key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
                 + "activeKey=/dc/active currentValue=euc2-blue", lines.get(0));
-        assertEquals("NOT_ACTIVE key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
+        assertEquals("NOT_ACTIVE environment=default key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
                 + "activeKey=/dc/active", lines.get(1));
     }
 
@@ -87,7 +90,7 @@ class TextPiplexObserverTest {
     void keepsAReasonOneValueOnOneLine(final String typed, final String written) {
         observer.disabled(RUN, typed);
 
-        assertEquals(List.of("DISABLED key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 reason="
-                + written), lines);
+        assertEquals(List.of("DISABLED environment=default key=eod generation=2026-09-12 "
+                + "owner=euc1-blue run=eod#142 reason=" + written), lines);
     }
 }

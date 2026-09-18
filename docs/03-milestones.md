@@ -51,7 +51,7 @@ the declarative whole-build pattern described in [Jenkins](05-jenkins.md#complet
 
 ### Record and repair
 
-`piplex/milestone/<key>` contains:
+`piplex/<environment>/milestone/<key>` contains:
 
 ```json
 {"generation":"2026-09-14","by":"euc1-blue","runId":"eod#142","at":"2026-09-15T02:37:12Z"}

@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.exclusive;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.switches.Switches;
 
@@ -72,8 +73,6 @@ public record ExclusiveRequest(String key,
     /** The default lease: short, because it is the handover bound and not the work's duration. */
     public static final Duration DEFAULT_LEASE = Duration.ofSeconds(60);
 
-    // Where piplex keeps its own records; an active key there would collide with one of them.
-    private static final String OWN_PREFIX = "piplex/";
 
     /**
      * Validates the request.
@@ -88,8 +87,8 @@ public record ExclusiveRequest(String key,
         Objects.requireNonNull(guardGrace, "guardGrace");
         Objects.requireNonNull(handoverWait, "handoverWait");
         // A blank one does not fail either: every key this request turns on is a prefix plus this, so
-        // what it competes for is the prefix itself -- one lease shared by every piece of work on the
-        // controller, which reads as contention nobody can account for.
+        // what it competes for is the prefix itself -- one lease shared by every piece of work in the
+        // environment, which reads as contention nobody can account for.
         if (key.isBlank()) {
             throw new IllegalArgumentException("key must not be blank");
         }
@@ -126,9 +125,12 @@ public record ExclusiveRequest(String key,
             if (activeKey.isBlank()) {
                 throw new IllegalArgumentException("activeKey must not be blank");
             }
-            if (activeKey.startsWith(OWN_PREFIX)) {
+            // Every key piplex writes is under this, in every environment, so an active key there
+            // would collide with one of them -- if not today's, then one of another environment's.
+            if (activeKey.startsWith(Environment.ROOT)) {
                 throw new IllegalArgumentException(
-                        "activeKey must not be under '" + OWN_PREFIX + "', but got '" + activeKey + "'");
+                        "activeKey must not be under '" + Environment.ROOT + "', but got '"
+                                + activeKey + "'");
             }
             if (activeValue.isBlank()) {
                 throw new IllegalArgumentException("activeValue must not be blank");

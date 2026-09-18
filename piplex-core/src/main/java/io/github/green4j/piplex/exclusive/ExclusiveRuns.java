@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.exclusive;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.UnreadableKeyException;
 import io.github.green4j.piplex.milestone.Milestone;
@@ -36,7 +37,7 @@ import java.util.concurrent.CompletionStage;
  */
 public final class ExclusiveRuns {
 
-    private static final String LEASE_PREFIX = "piplex/exclusive/";
+    private static final String KIND = "exclusive";
     // The first look after a key moved; each one after it waits twice as long, up to a whole round.
     private static final Duration HURRY_FROM = Duration.ofMillis(500);
 
@@ -44,6 +45,7 @@ public final class ExclusiveRuns {
     private final TimeSource time;
     private final PiplexObserver observer;
     private final Milestones milestones;
+    private final Environment environment;
 
     /**
      * @param store where the designation, the switch, the milestone and the lease live
@@ -61,10 +63,26 @@ public final class ExclusiveRuns {
     public ExclusiveRuns(final CoordinationStore store,
                          final TimeSource time,
                          final PiplexObserver observer) {
+        this(store, time, observer, Environment.DEFAULT);
+    }
+
+    /**
+     * @param store       where the designation, the switch, the milestone and the lease live
+     * @param time        where time comes from
+     * @param observer    told about every decision; this is where the timeline comes from
+     * @param environment which set of orchestrations this work belongs to
+     */
+    public ExclusiveRuns(final CoordinationStore store,
+                         final TimeSource time,
+                         final PiplexObserver observer,
+                         final Environment environment) {
         this.store = FailFastStore.of(store, time);
         this.time = Objects.requireNonNull(time, "time");
         this.observer = Objects.requireNonNull(observer, "observer");
-        this.milestones = new Milestones(this.store, this.time, this.observer);
+        this.environment = Objects.requireNonNull(environment, "environment");
+        // The same environment, deliberately: a run which completes its work writes the milestone it
+        // was asked to complete, and the two must be the same key.
+        this.milestones = new Milestones(this.store, this.time, this.observer, this.environment);
     }
 
     /**
@@ -94,26 +112,44 @@ public final class ExclusiveRuns {
         return answer;
     }
 
-    static String designationKey(final String key) {
-        return Designations.keyOf(key);
+    static String designationKey(final Environment environment, final String key) {
+        return Designations.keyOf(environment, key);
     }
 
-    static String switchKey(final String key) {
-        return Switches.keyOf(key);
+    static String switchKey(final Environment environment, final String key) {
+        return Switches.keyOf(environment, key);
     }
 
-    // The switch that drains only this owner, or null when the request consults none.
+    // The switch that drains only this owner, or null when the request consults none. Logical, so the
+    // environment is added later, where the store key is composed.
     static String ownSwitch(final ExclusiveRequest request) {
         return request.enabledBy() == null ? null : Switches.ownerKey(request.enabledBy(), request.ownerId());
     }
 
-    // External, so taken as is.
+    // External, so taken as is -- including its environment, which is whoever writes it to arrange.
     static String activeKey(final String key) {
         return key;
     }
 
-    static String leaseKey(final String key) {
-        return LEASE_PREFIX + key;
+    static String leaseKey(final Environment environment, final String key) {
+        return environment.prefixOf(KIND) + key;
+    }
+
+    // The same keys, in this instance's environment. The store keys of one run all come from here.
+    private String designationKey(final String key) {
+        return designationKey(environment, key);
+    }
+
+    private String switchKey(final String key) {
+        return switchKey(environment, key);
+    }
+
+    private String milestoneKey(final String key) {
+        return Milestones.keyOf(environment, key);
+    }
+
+    private String leaseKey(final String key) {
+        return leaseKey(environment, key);
     }
 
     /**
@@ -174,7 +210,8 @@ public final class ExclusiveRuns {
         try {
             milestone = Milestone.parse(asRead.value());
         } catch (final RuntimeException notReadable) {
-            return unreadable(request, Milestones.keyOf(request.completedWhen()), "milestone", notReadable);
+            return unreadable(request, Milestones.keyOf(environment, request.completedWhen()), "milestone",
+                    notReadable);
         }
         if (!milestone.generation().atLeast(request.generation())) {
             return null;
@@ -194,11 +231,11 @@ public final class ExclusiveRuns {
      * @return what they all said
      */
     private CompletionStage<Guards> readGuards(final ExclusiveRequest request) {
-        return read(request.designatedBy(), ExclusiveRuns::designationKey).thenCompose(designation ->
-                read(request.enabledBy(), ExclusiveRuns::switchKey).thenCompose(state ->
-                        read(ownSwitch(request), ExclusiveRuns::switchKey).thenCompose(ownState ->
+        return read(request.designatedBy(), this::designationKey).thenCompose(designation ->
+                read(request.enabledBy(), this::switchKey).thenCompose(state ->
+                        read(ownSwitch(request), this::switchKey).thenCompose(ownState ->
                                 read(request.activeKey(), ExclusiveRuns::activeKey).thenCompose(active ->
-                                        read(request.completedWhen(), Milestones::keyOf).thenApply(milestone ->
+                                        read(request.completedWhen(), this::milestoneKey).thenApply(milestone ->
                                                 new Guards(designation, state, ownState, active, milestone))))));
     }
 
@@ -252,7 +289,8 @@ public final class ExclusiveRuns {
                     ? Designation.parse(guards.designation().value()).owner()
                     : null;
         } catch (final RuntimeException notReadable) {
-            return unreadable(request, designationKey(request.designatedBy()), "designation", notReadable);
+            return unreadable(request, designationKey(request.designatedBy()), "designation",
+                    notReadable);
         }
         return request.ownerId().equals(owner) ? null : new Admission.NotDesignated(owner);
     }
@@ -449,8 +487,8 @@ public final class ExclusiveRuns {
                                                final long guardsReadAtNanos) {
         final RunRef ref = refOf(request);
         final HeldAdmission admitted = new HeldAdmission(
-                store, milestones, request, handle, time, leaseKey(request.key()), observer, ref,
-                acquiredAtNanos, remaining, guardsReadAtNanos);
+                store, milestones, request, environment, handle, time, leaseKey(request.key()),
+                observer, ref, acquiredAtNanos, remaining, guardsReadAtNanos);
         try {
             // Told before arming: a watch which answers at once revokes from inside start(), and a log
             // must not say a run lost what it had not yet been said to have.
@@ -592,8 +630,9 @@ public final class ExclusiveRuns {
         return null;
     }
 
-    private static RunRef refOf(final ExclusiveRequest request) {
-        return new RunRef(request.key(), request.generation(), request.ownerId(), request.runId());
+    private RunRef refOf(final ExclusiveRequest request) {
+        return new RunRef(
+                environment, request.key(), request.generation(), request.ownerId(), request.runId());
     }
 
     /**
@@ -643,11 +682,11 @@ public final class ExclusiveRuns {
         private Duration hurry;
 
         private Ask(final ExclusiveRequest request) {
-            designation = standing(request.designatedBy(), ExclusiveRuns::designationKey);
-            switchEntry = standing(request.enabledBy(), ExclusiveRuns::switchKey);
-            ownSwitch = standing(ownSwitch(request), ExclusiveRuns::switchKey);
+            designation = standing(request.designatedBy(), ExclusiveRuns.this::designationKey);
+            switchEntry = standing(request.enabledBy(), ExclusiveRuns.this::switchKey);
+            ownSwitch = standing(ownSwitch(request), ExclusiveRuns.this::switchKey);
             active = standing(request.activeKey(), ExclusiveRuns::activeKey);
-            milestone = standing(request.completedWhen(), Milestones::keyOf);
+            milestone = standing(request.completedWhen(), ExclusiveRuns.this::milestoneKey);
         }
 
         private StandingWatch standing(final String key, final KeyMapper mapper) {

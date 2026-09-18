@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.exclusive;
 
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.milestone.Milestones;
 import io.github.green4j.piplex.milestone.PublishResult;
@@ -53,6 +54,7 @@ final class HeldAdmission implements Admitted {
     private final CoordinationStore store;
     private final Milestones milestones;
     private final ExclusiveRequest request;
+    private final Environment environment;
     private final LeaseHandle handle;
     private final TimeSource time;
     private final String leaseKey;
@@ -86,6 +88,7 @@ final class HeldAdmission implements Admitted {
     HeldAdmission(final CoordinationStore store,
                   final Milestones milestones,
                   final ExclusiveRequest request,
+                  final Environment environment,
                   final LeaseHandle handle,
                   final TimeSource time,
                   final String leaseKey,
@@ -97,6 +100,7 @@ final class HeldAdmission implements Admitted {
         this.store = store;
         this.milestones = milestones;
         this.request = request;
+        this.environment = environment;
         this.handle = handle;
         this.time = time;
         this.leaseKey = leaseKey;
@@ -127,14 +131,14 @@ final class HeldAdmission implements Admitted {
         armGiveUp(lastRenewedNanos, leaseValidUntilNanos);
         scheduleRenew();
         if (request.designatedBy() != null) {
-            guard(new Guard(ExclusiveRuns.designationKey(request.designatedBy()), "designation",
-                    this::designationSays)).begin(designationVersion);
+            guard(new Guard(ExclusiveRuns.designationKey(environment, request.designatedBy()),
+                    "designation", this::designationSays)).begin(designationVersion);
         }
         if (request.enabledBy() != null) {
-            guard(new Guard(ExclusiveRuns.switchKey(request.enabledBy()), "switch",
+            guard(new Guard(ExclusiveRuns.switchKey(environment, request.enabledBy()), "switch",
                     this::switchSays)).begin(switchVersion);
-            guard(new Guard(ExclusiveRuns.switchKey(ExclusiveRuns.ownSwitch(request)), "switch",
-                    this::switchSays)).begin(ownSwitchVersion);
+            guard(new Guard(ExclusiveRuns.switchKey(environment, ExclusiveRuns.ownSwitch(request)),
+                    "switch", this::switchSays)).begin(ownSwitchVersion);
         }
         if (request.activeKey() != null) {
             guard(new Guard(ExclusiveRuns.activeKey(request.activeKey()), "active key",
