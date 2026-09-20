@@ -13,9 +13,6 @@ defaultTasks 'clean', 'build'
 
 def projectVersion = file('version.txt').text.trim()
 
-// A script variable rather than a method, and the two below rather than ext: a subproject reaching
-// into the root for either one is deprecated in Gradle 9 and gone in 10, while what a closure in this
-// file closes over stays local to it.
 def configProperty = { final String propertyName ->
     String value = project.findProperty(propertyName)
     if (!value) {
@@ -29,14 +26,12 @@ def configProperty = { final String propertyName ->
 
 def piplexSrcJavaVersion = JavaVersion.toVersion(srcJavaVersion)
 
-// Sources are pure ASCII, and are never decoded with whatever encoding the build machine
-// happens to default to. javac reports any non-ASCII byte as an unmappable character. Write
-// one in a literal as \\uXXXX, and in javadoc as its ASCII equivalent ("--").
 def piplexSourceEncoding = 'US-ASCII'
 
 def coreProject = project(':piplex-core')
 def discasProject = project(':piplex-discas')
 def jenkinsProject = project(':piplex-jenkins')
+def initProject = project(':piplex-init')
 def exampleProject = project(':piplex-example')
 
 subprojects {
@@ -46,11 +41,6 @@ subprojects {
     version = projectVersion
 
     repositories {
-        // Central only. mavenLocal() resolves ahead of it, so a dependency built on somebody's laptop
-        // silently replaces the published one of the same version, and the .hpi stops being the bytes
-        // this git hash describes -- which is the whole claim a release makes. Trying an unpublished
-        // discas is `--include-build ../discas`, which says so at the command line and leaves no trace
-        // in the build.
         mavenCentral()
     }
 
@@ -80,6 +70,7 @@ subprojects {
 configure([coreProject,
            discasProject,
            jenkinsProject,
+           initProject,
            exampleProject]) {
     apply plugin: 'checkstyle'
 
@@ -141,7 +132,8 @@ configure([coreProject,
 // to be read and run, and a coverage figure over them is one nobody should act on.
 configure([coreProject,
            discasProject,
-           jenkinsProject]) {
+           jenkinsProject,
+           initProject]) {
     apply plugin: 'jacoco'
 
     check {
@@ -188,8 +180,6 @@ configure(discasProject) {
         api project(coreProject.path)
         api "io.github.green4j:discas-client:$discasVersion"
 
-        // Tests only. The client is final, so the adapter is exercised against a node brought up in
-        // the test JVM rather than against a stand-in for one.
         testImplementation "io.github.green4j:discas-node:$discasVersion"
         testImplementation testFixtures(project(coreProject.path))
     }
@@ -201,28 +191,19 @@ configure(jenkinsProject) {
     apply plugin: 'org.jenkins-ci.jpi2'
 
     repositories {
-        // The plugin's own shorthand for repo.jenkins-ci.org, so the one place a Jenkins artifact can
-        // come from is named rather than spelled out.
         jenkinsPublic()
     }
 
-    // A baseline is a core version and the plugin BOM that was tested against it, and choosing one is
-    // naming it once. They were three independent properties, which meant a core version could be given
-    // a BOM from another line: that resolves perfectly well and quietly tests a combination nobody ships.
-    // Adding a line here is the whole change; nothing else has a version of Jenkins in it.
-    def jenkinsLines = [
-            '2.555.1': 'bom-2.555.x:7020.vf38cb_40380d1',
-            '2.568.3': 'bom-2.568.x:7020.vf38cb_40380d1'
-    ]
     def jenkinsBaseline = configProperty('jenkinsVersion') ?: project.property('jenkinsVersion')
-    def jenkinsBom = jenkinsLines[jenkinsBaseline]
-    if (jenkinsBom == null) {
+    def patchSeparator = jenkinsBaseline.lastIndexOf('.')
+    if (patchSeparator < 1) {
         throw new GradleException(
-                "No plugin BOM is known for Jenkins ${jenkinsBaseline}. Baselines this build has: "
-                        + "${jenkinsLines.keySet().join(', ')}. Add the line and its BOM to "
-                        + 'jenkinsLines in build.gradle -- a BOM pinned by hand beside a core version '
-                        + 'is the pairing this table exists to prevent.')
+                "jenkinsVersion must name a release such as 2.568.3, got '${jenkinsBaseline}'")
     }
+    def jenkinsLine = jenkinsBaseline.substring(0, patchSeparator)
+    def jenkinsBomVersion = configProperty('jenkinsBomVersion')
+            ?: project.property('jenkinsBomVersion')
+    def jenkinsBom = "bom-${jenkinsLine}.x:${jenkinsBomVersion}"
 
     jenkinsPlugin {
         jenkinsVersion = jenkinsBaseline
@@ -245,11 +226,16 @@ configure(jenkinsProject) {
         implementation 'org.jenkins-ci.plugins.workflow:workflow-api'
         implementation 'org.jenkins-ci.plugins:structs'
 
-        // No jsr305, and so no @NonNull anywhere in this module. Jenkins' own @NonNull is
-        // meta-annotated with javax.annotation.Nonnull, javac warns on an annotation whose class file
-        // it cannot read, and -Werror turns that into a failure -- so using one annotation means
-        // carrying a dependency for it. What it was on was five getDisplayName() overrides returning
-        // a literal, each already @NonNull in the Jenkins class it overrides.
+        // An operator block acts under an identity of its own, and the credential carrying it is
+        // resolved against the running build rather than read from the global configuration. That
+        // resolution is what enforces who may act as the operations client: a folder-scoped
+        // credential is invisible to jobs outside the folder. Doing it any other way -- a second
+        // identity in Manage Jenkins -- would hand every job on the controller the same rights.
+        implementation 'org.jenkins-ci.plugins:credentials'
+        // The two credential kinds a discas node authenticates on: a client certificate under
+        // --client-auth mtls, and a token under --client-auth token. The certificate type is in
+        // credentials itself; secret text is not.
+        implementation 'org.jenkins-ci.plugins:plain-credentials'
 
         // Jenkins finds an extension through an index generated at compile time, not by scanning at
         // startup. Without these two on the processor path everything compiles and nothing is found.
@@ -264,6 +250,10 @@ configure(jenkinsProject) {
         // allocated. Declarative is not a dependency of the plugin itself.
         testImplementation 'org.jenkinsci.plugins:pipeline-model-definition'
         testImplementation 'org.jenkins-ci.main:jenkins-test-harness'
+        // The generator, so these tests run the jobs a deployment actually installs rather than a
+        // template nobody filled in. Test only: nothing in the .hpi knows this module exists.
+        testImplementation project(initProject.path)
+
 
         // The restart test needs JenkinsSessionRule, which is a JUnit 4 rule and has no JUnit 5
         // equivalent. One test class runs on the vintage engine; the rest stay on Jupiter.
@@ -315,7 +305,69 @@ configure(jenkinsProject) {
         useJUnitPlatform {
             excludeTags 'record-state-fixtures'
         }
+        // The operator job templates reach these tests on piplex-init's classpath, where the
+        // generator reads them: the tests run what a deployment installs rather than a copy of it,
+        // which is the only way a job that stops working gets noticed here instead of during an
+        // incident. Editing a template rebuilds that jar, so this task is invalidated with it.
     }
+
+    sourceSets {
+        intTest {
+            // The unit tests' output too, for the helpers both sets share -- KeyStores among them.
+            compileClasspath += sourceSets.main.output + sourceSets.test.output
+            runtimeClasspath += sourceSets.main.output + sourceSets.test.output
+        }
+    }
+
+    configurations {
+        intTestImplementation.extendsFrom testImplementation
+        intTestRuntimeOnly.extendsFrom testRuntimeOnly
+    }
+
+    dependencies {
+        intTestImplementation platform("org.testcontainers:testcontainers-bom:${testcontainersVersion}")
+        intTestImplementation 'org.testcontainers:testcontainers'
+    }
+
+    tasks.register('intTest', Test) {
+        group = 'verification'
+        description = 'Runs the plugin against a discas node from the published image'
+        useJUnitPlatform()
+        testClassesDirs = sourceSets.intTest.output.classesDirs
+        // Plus whatever the jpi plugin adds to the unit tests' classpath beyond their own source set:
+        // the directory jenkins-test-harness reads to install plugins into a JenkinsRule controller,
+        // which it puts on that task rather than on the source set. Taken from the task instead of
+        // named, so a jpi upgrade that moves the directory moves this with it.
+        classpath = sourceSets.intTest.runtimeClasspath +
+                (tasks.test.classpath - sourceSets.test.runtimeClasspath)
+        dependsOn tasks.named('copyTestPluginDependencies')
+
+        // The same opens the unit tests need: this one starts a controller too.
+        jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED',
+                '--add-opens=java.base/java.io=ALL-UNNAMED',
+                '--add-opens=java.base/java.util=ALL-UNNAMED',
+                '--add-opens=java.desktop/com.sun.beans.introspect=ALL-UNNAMED'
+
+        systemProperty 'piplex.discasVersion', discasVersion
+
+        // Colima puts its socket in the home directory and binds nothing at /var/run/docker.sock, so
+        // Testcontainers otherwise finds no daemon and the required suite fails on a machine that
+        // does have one.
+        def colima = file("${System.getProperty('user.home')}/.colima/default/docker.sock")
+        if (!System.getenv('DOCKER_HOST') && !file('/var/run/docker.sock').exists() && colima.exists()) {
+            environment 'DOCKER_HOST', "unix://${colima}"
+            environment 'TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE', '/var/run/docker.sock'
+        }
+
+        testLogging {
+            events 'skipped', 'failed'
+            showStandardStreams = true
+            exceptionFormat = 'full'
+        }
+    }
+
+    check.dependsOn intTest
+
     tasks.register('recordStateFixtures', Test) {
         group = 'verification'
         description = 'Records the saved-state fixtures of the current STATE_VERSION, once'
@@ -331,10 +383,50 @@ configure(jenkinsProject) {
     }
 
     // The jpi plugin brings sources and javadoc jars of its own, for a publication this build does not
-    // make. Only the .hpi ships, so they are dead weight on every build. Matched rather than named:
-    // the plugin registers them after this block is evaluated.
+    // make. Only the .hpi ships, so they are dead weight on every build.
     tasks.matching { it.name in ['javadoc', 'javadocJar', 'sourcesJar'] }.configureEach {
         enabled = false
+    }
+}
+
+configure(initProject) {
+    dependencies {
+        // The key composition the runtime uses, not a second copy of it: a grant this writes and the
+        // key a step writes are then the same string by construction rather than by review.
+        implementation project(coreProject.path)
+        // Prompt and GetOpts, which are dependency-free and already on this build's classpath. An
+        // operator tool that drags a terminal library in is one more thing to ship.
+        implementation "io.github.green4j:discas-common:$discasVersion"
+    }
+
+    // One jar an operator can copy to a machine and run. The two dependencies are small and
+    // dependency-free themselves, and somebody preparing a deployment should not have to assemble a
+    // classpath first -- the release archive's launchers run this jar directly.
+    jar {
+        manifest {
+            attributes 'Main-Class': 'io.github.green4j.piplex.init.PiplexInit'
+        }
+        // Buildable, so this is also what tells Gradle the sibling jars have to exist first.
+        dependsOn configurations.runtimeClasspath
+        from {
+            configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+        }
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+        // Signatures of the jars being unpacked, which no longer describe this one.
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA', 'META-INF/LICENSE*'
+    }
+
+    // Regeneration only. Gradle forks without a console, so System.console() is null and the
+    // dialogue answers every question with its default rather than blocking a build -- which is
+    // Prompt's whole contract. To be asked anything, run the jar from a terminal.
+    //
+    //   ./gradlew :piplex-init:run --args="--from estate.properties"
+    //   java -jar piplex-init/build/libs/piplex-init-<version>.jar
+    tasks.register('run', JavaExec) {
+        group = 'application'
+        description = 'Regenerates an estate --from a description; the dialogue needs a terminal'
+        classpath = sourceSets.main.runtimeClasspath
+        mainClass = 'io.github.green4j.piplex.init.PiplexInit'
     }
 }
 

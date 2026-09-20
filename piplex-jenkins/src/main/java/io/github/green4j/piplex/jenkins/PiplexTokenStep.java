@@ -76,8 +76,9 @@ public final class PiplexTokenStep extends Step {
 
         @Override
         public Set<? extends Class<?>> getRequiredContext() {
-            // Asking Jenkins for it is what produces the sentence somebody using this outside a block
-            // needs: the context is missing, and the step which provides it is named.
+            // PiplexOwnership is what confines this to piplexExclusive. Asking Jenkins for it is what
+            // produces the sentence somebody using it outside needs: the context is missing, and the
+            // step which provides it is named.
             return Set.of(PiplexOwnership.class);
         }
     }

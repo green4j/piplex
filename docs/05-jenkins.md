@@ -1,7 +1,9 @@
 ## 5. The Jenkins plugin
 
-The plugin configures one shared store per controller and exposes four Pipeline steps:
-`piplexExclusive`, `piplexPublish`, `piplexAwait` and `piplexToken`.
+The plugin configures one shared store per controller and exposes two sets of Pipeline steps. Four
+are written into the jobs that do the work: `piplexExclusive`, `piplexPublish`, `piplexAwait` and
+`piplexToken`. Four more change what the work is allowed to do: `withPiplexOperator` and the
+`piplexDesignate`, `piplexSwitch` and `piplexInspect` steps used with it.
 
 [Stored keys](01-model.md#stored-keys) shows which discas key each step parameter reads or writes.
 
@@ -33,7 +35,8 @@ The supported security combinations are:
 Unsafe or ambiguous combinations fail before a store is built. See
 [discas and security](07-discas.md).
 
-Configuration as Code uses the `piplex` symbol:
+Configuration as Code uses the `piplex` symbol. `piplex-init` writes this file per controller -- see
+[Deployment](09-deployment.md) -- and the fields are these:
 
 ```yaml
 unclassified:
@@ -73,8 +76,9 @@ when no guarded work is running, or accept that revocation.
 
 The controller also writes `piplex/<environment>/instances/<ownerId>` every 30 seconds, in its own
 default environment. Seeing another process mark under the same owner activates an administrative
-warning and logs a warning in builds. Two controllers sharing an owner id in different environments
-are two deployments rather than one duplicated, and are not reported.
+warning and logs a warning in builds. Why the mark goes in the controller's own environment rather
+than a step's, and what that means for two deployments, is in
+[Stored keys](01-model.md#stored-keys).
 
 ### `piplexExclusive`
 
@@ -260,8 +264,24 @@ piplexPublish key: 'data/euc1',                 // Milestone to raise
               environment: 'prod'              // Optional; the controller's default otherwise
 ```
 
+| Parameter | Default | Meaning |
+|---|---|---|
+| `key` | required | The milestone to raise |
+| `generation` | required | How far the producer got, usually the business date |
+| `environment` | controller default | Which set of orchestrations it belongs to |
+| `overwriteUnreadable` | `false` | Overwrite a record that does not parse. Against a readable one it changes nothing |
+
 Publish only after successful work. The step returns the generation in force. A restart repeats the
 write safely because milestone publication is monotonic and idempotent.
+
+Stopping the build waits up to a minute for a write already sent, so the lease does not go back while
+the milestone is still on its way. No longer: a store that has stopped answering must not hold the
+executor until Jenkins kills the build.
+
+`overwriteUnreadable` does not weaken that: monotonicity holds against a readable record either way,
+so a milestone at or ahead of the generation given is still kept. It is one parameter with one
+meaning on all three writing steps -- see
+[6. A key holds something nothing can parse](06-operations.md#6-a-key-holds-something-nothing-can-parse).
 
 ### `piplexAwait`
 
@@ -284,6 +304,176 @@ piplexAwait key: 'data/euc1',                 // Milestone to watch
 
 The wait holds no executor. A controller restart reads again but starts the timeout over. Stopping the
 build cancels the wait within its current one-minute round.
+
+### Operator steps
+
+The steps above are written into the jobs that do the work. The four below are written into jobs
+that change what the work is allowed to do, and they are kept apart on purpose: reading a Jenkinsfile
+should say which of the two it is.
+
+#### `withPiplexOperator`
+
+Operator writes are made inside this block and nowhere else. A step that finds no block is refused
+rather than falling back to this controller's identity, so there is no way to make an operator change
+without the file saying that one is being made, and as whom.
+
+```groovy
+// Goal: act as the operations identity. Effect: writes inside are made as piplex-ops, and only jobs
+// that can read the credential can make them
+withPiplexOperator(credentialsId: 'piplex-ops-cert',  // The Jenkins credential carrying the identity
+                   clientId: 'piplex-ops',            // The name the cluster's ACL grants
+                   environment: 'prod') {             // Name it; see below
+    piplexDesignate key: 'eod-owner', owner: 'euc1-green', reason: 'INC-4821'
+}
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `credentialsId` | none | The credential carrying the identity. Unset, the block acts as this controller |
+| `clientId` | none | The discas identity to connect as, which is what an ACL grants. Required with a credential |
+| `environment` | controller default | Which set of orchestrations to write in |
+
+**Name the environment.** An operator job is copied between controllers, and a job inheriting
+whatever the controller defaults to is how one meant for prod quietly writes to uat. The work steps
+do not have this problem, because they live beside the work they guard.
+
+With no `credentialsId` the block acts as this controller, which is what the shared identity of
+[Who writes what](07-discas.md#who-writes-what) intends, and is what the Script Console did without
+needing ADMINISTER. With one it acts as that identity -- see
+[Operator credentials](#operator-credentials).
+
+A block does not survive a controller restart. The credential was checked before the restart and not
+after, and a handful of writes is cheap to run again.
+
+#### `piplexDesignate`
+
+```groovy
+// Goal: move the work. Effect: the current holder is revoked and stops; a candidate parked on the new
+// owner within its handoverWait takes over
+piplexDesignate key: 'eod-owner',      // The key a request names in designatedBy
+                owner: 'euc1-green',   // The ownerId that should hold the work
+                reason: 'INC-4821'     // Written into the record, and the only account piplex keeps
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `key` | required | The key a request names in `designatedBy` |
+| `owner` | required | The `ownerId` that should hold the work |
+| `reason` | none | Why, in the words a change record would use |
+| `overwriteUnreadable` | `false` | Overwrite a record that does not parse. Against a readable one it changes nothing |
+
+Returns the owner in force. Past `handoverWait` the new owner runs at its next scheduled build, which
+for nightly work means the round is not done tonight: designating is a race against a deadline.
+
+#### `piplexSwitch`
+
+```groovy
+// Goal: stop the work everywhere. Effect: running builds stop, new ones skip, nobody takes over
+piplexSwitch key: 'eod-switch', enabled: false, reason: 'bad upstream data'
+
+// Goal: take this controller out for maintenance. Effect: only this owner stops, and the step waits
+// until work already running here has actually stopped
+piplexSwitch key: 'eod-switch', enabled: false, ownerId: 'euc1-blue',
+             reason: 'patching', drainTimeout: '30m'
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `key` | required | The switch, as a request names it in `enabledBy` |
+| `enabled` | required | Whether the work it guards may run |
+| `reason` | none | Why, in the words a change record would use |
+| `ownerId` | none | Drain one controller instead of stopping the work everywhere |
+| `drainTimeout` | none | Wait this long for work already running **here** to stop |
+| `overwriteUnreadable` | `false` | Overwrite a record that does not parse. Against a readable one it changes nothing |
+
+Without `ownerId` this is the shared switch and halts the work itself; with one it is maintenance and
+leaves the work running elsewhere. They are different decisions with very different blast radii, and
+a job that can do one need not be a job that can do the other.
+
+`drainTimeout` is only for draining **this** controller. An admission is held by a process and no key
+records which processes are still in one, so the question can only be answered locally -- and
+answering it for another controller would report it quiet while it was still working. The step
+refuses rather than doing that.
+
+Draining another owner without it is allowed: the switch is that owner's key, and writing it is a
+real change. Only the waiting is impossible, so the step logs what it did not check:
+
+```text
+piplex: NOT CONFIRMED 'euc1-green' takes no new work, and nothing here can see what that
+controller is still running. Run the drain on 'euc1-green' itself, which is where the wait
+can be answered
+```
+
+The same line, pointing at this controller, follows a drain of the local owner with no
+`drainTimeout`. A build is green as soon as the switch is written, and "the switch is off" is not
+the answer somebody about to patch a machine is after.
+
+#### `piplexInspect`
+
+```groovy
+// Goal: find out why tonight's round has not run. Effect: reads every guard and says what is
+// stopping it, in one answer
+def why = piplexInspect key: 'eod', designatedBy: 'eod-owner', enabledBy: 'eod-switch',
+                        completedWhen: 'data/euc1', generation: env.BUSINESS_DATE,
+                        activeWhenKey: '/dc/active', activeWhenValue: 'euc1-blue'
+```
+
+Takes the same parameters as `piplexExclusive`, so a diagnosis is written by copying the request being
+diagnosed. Returns what is stopping the work, empty when nothing is. Needs no operator identity and no
+block: every controller can read its own guards however the ACL is written, and reading grants nobody
+anything. It has no `overwriteUnreadable`, and that is deliberate -- it is the one step everyone may
+run, and a write parameter on it would make "may diagnose" and "may overwrite shared state" one
+permission.
+
+Each guard is read on its own, so one that will not parse is reported `UNREADABLE` with the job and
+parameters that put it back, and the remaining guards are still read. That is the case this step
+exists for, so it is the case it must survive rather than fail on.
+
+Two warnings can precede the reading, and both mark the build `UNSTABLE`: another live controller
+using this owner id, and a heartbeat not written lately, which means the first check is not running.
+Neither stops the work, so neither is returned as a blocker.
+
+It cannot say who holds the lease. There is no read-only way to ask -- the only way to learn the
+holder is to try to take it -- so where the guards explain nothing it bounds its answer instead of
+naming a cause it never established: a run holding the lease is one of the things left, its build log
+naming `ownerId/runId`, and the schedule never firing is another.
+
+### Operator credentials
+
+Where [the operator has its own identity](07-discas.md#does-the-operator-get-its-own-identity) it is not this
+controller's, and it reaches a job as a Jenkins credential.
+
+| Cluster mode | Credential kind |
+|---|---|
+| `mtls` | Certificate, holding the PKCS12 whose CN is the `clientId` |
+| `token` | Secret text, holding the token |
+| `allowall` | None, and a second identity is refused: a client id there is a claim, not a proof |
+
+**Where it lives is the access control.** The credential is resolved against the running build, not
+read from the global configuration, so a folder-scoped credential is invisible to jobs outside that
+folder -- and that is the whole enforcement. Put the operations credential in the folder holding the
+operator jobs.
+
+Do not put it in the global store. Every job on the controller could then resolve it, which hands
+them all the identity the ACL separated out, and the separation survives only in the ACL file.
+
+**Job/Configure in that folder is the right to act as the operations client.** Whoever can edit a
+Jenkinsfile there can write a block that uses the credential. Grant it as that, not as permission to
+edit a job.
+
+One name runs through all four levels, and a mismatch shows up at whichever one it was typed into:
+
+```text
+certificate CN = piplex-ops
+Jenkins credential 'piplex-ops-cert' in folder 'ops', holding that certificate
+acl.piplex-ops = piplex/prod/designated/:GC ; piplex/prod/enabled/:GC
+withPiplexOperator(credentialsId: 'piplex-ops-cert', clientId: 'piplex-ops')
+```
+
+**Rotation** replaces the credential, and nothing else: the block builds its client when it runs, so
+the next operator build uses the new one. No Save, and no rebuilding of the store the work is running
+on -- unlike rotating this controller's own certificate, which closes the store and revokes what it
+was holding.
 
 ### Branching
 

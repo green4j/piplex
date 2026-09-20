@@ -55,7 +55,7 @@ public final class ElectedRunExample {
             // The work would go here, under the one that was admitted. isHeld() is what a run checks
             // before anything it cannot take back: admission is held, not granted once, and between
             // two irreversible steps it can be taken away.
-            final Admitted holder = (Admitted) first;
+            final Admitted holder = Examples.admitted(first);
             Examples.say("Frankfurt is working, still holds it: " + holder.isHeld());
 
             Examples.await(holder.release());

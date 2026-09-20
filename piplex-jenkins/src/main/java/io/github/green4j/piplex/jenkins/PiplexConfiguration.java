@@ -7,6 +7,9 @@
 
 package io.github.green4j.piplex.jenkins;
 
+import com.cloudbees.plugins.credentials.common.StandardCertificateCredentials;
+import com.cloudbees.plugins.credentials.common.StandardCredentials;
+import com.cloudbees.plugins.credentials.impl.CertificateCredentialsImpl;
 import hudson.AbortException;
 import hudson.BulkChange;
 import hudson.Extension;
@@ -42,6 +45,7 @@ import jenkins.model.GlobalConfiguration;
 import jenkins.model.Jenkins;
 import net.sf.json.JSONObject;
 import org.jenkinsci.Symbol;
+import org.jenkinsci.plugins.plaincredentials.StringCredentials;
 import org.jenkinsci.plugins.workflow.flow.FlowExecutionList;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.StaplerRequest2;
@@ -55,7 +59,9 @@ import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.util.Enumeration;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -369,6 +375,17 @@ public final class PiplexConfiguration extends GlobalConfiguration {
             binding = false;
         }
         try {
+            // Here and not in check(): a form is a whole set of settings at once, which is what makes
+            // a combination judgeable, while every setter reaches check() through save() and one at a
+            // time is where an invalid combination on the way to a valid one is legitimate. Left to
+            // the first build, an unticked TLS box with a store behind it saves green and then fails
+            // every job on the controller, naming fields the closed block hides.
+            combinations(snapshot(), ClientCredentials.of(snapshot()));
+        } catch (final AbortException refused) {
+            restore(before);
+            throw new FormException(refused.getMessage(), refused, "tls");
+        }
+        try {
             changed();
         } catch (final InvalidSetting refused) {
             // Shown beside the field on the page rather than as a stack trace.
@@ -511,6 +528,42 @@ public final class PiplexConfiguration extends GlobalConfiguration {
                             String watchPollPeriod) {
     }
 
+    /**
+     * What a client authenticates with: this controller's own configuration, or an operator identity
+     * standing in for it.
+     *
+     * <p>Separated from {@link Settings} because the transport around it never varies. An operator
+     * block may connect as somebody else, but it connects to the same cluster, over the same TLS, and
+     * checks the nodes against the same trust store -- so only the two fields a discas node
+     * authenticates on are substitutable, and every rule about how they may be combined is applied to
+     * whichever pair is in force.
+     *
+     * <p>A key store arrives already loaded from a credential, or as a path still to be read. The
+     * distinction is not laziness for its own sake: a path is read only after the combination has been
+     * accepted, so a store configured while TLS is off is reported as that rather than as a file that
+     * would not open.
+     */
+    private record ClientCredentials(Secret token,
+                                     String keyStoreFile,
+                                     Secret keyStorePassword,
+                                     KeyStore loadedKeyStore) {
+
+        static ClientCredentials of(final Settings settings) {
+            return new ClientCredentials(settings.token(), settings.tlsKeystore(),
+                    settings.tlsKeystorePassword(), null);
+        }
+
+        boolean hasKeyStore() {
+            return keyStoreFile != null || loadedKeyStore != null;
+        }
+
+        KeyStore keyStore() throws AbortException {
+            return loadedKeyStore != null
+                    ? loadedKeyStore
+                    : pkcs12(keyStoreFile, keyStorePassword, "key store");
+        }
+    }
+
     @Override
     public String getDisplayName() {
         return "piplex";
@@ -626,6 +679,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     @Terminator(requires = FlowExecutionList.EXECUTIONS_SUSPENDED)
     public static void stopping() {
         ExclusiveStepExecution.abandonAll();
+        OperatorStepExecution.closeAll();
         final PiplexConfiguration configuration = get();
         if (configuration != null) {
             configuration.stop();
@@ -799,7 +853,16 @@ public final class PiplexConfiguration extends GlobalConfiguration {
         return store;
     }
 
-    private synchronized TimeSource time() throws AbortException {
+    /**
+     * The clock every wait in this plugin counts on, monotonic and shared with the store's own timers.
+     *
+     * <p>Package-private alongside {@link #store()}, and for a related reason: a step that waits for
+     * something on this controller has to count on the same clock the runs it is waiting for do.
+     *
+     * @return the clock
+     * @throws AbortException if the controller has not been configured
+     */
+    synchronized TimeSource time() throws AbortException {
         if (suppliedTime != null) {
             return suppliedTime;
         }
@@ -809,24 +872,211 @@ public final class PiplexConfiguration extends GlobalConfiguration {
         return time;
     }
 
-    private void build() throws AbortException {
+    /**
+     * The primitives of one operator block, and the client they hold open.
+     *
+     * <p>Closed when the block ends. Acting as this controller it owns nothing and closing it is a
+     * no-op, because the store it borrowed outlives the block.
+     */
+    static final class OperatorSession implements AutoCloseable {
+
+        private final Piplex piplex;
+        private final CoordinationStore own;
+
+        private OperatorSession(final Piplex piplex, final CoordinationStore own) {
+            this.piplex = piplex;
+            this.own = own;
+        }
+
+        Piplex piplex() {
+            return piplex;
+        }
+
+        @Override
+        public void close() {
+            if (own != null) {
+                own.close();
+            }
+        }
+    }
+
+    /**
+     * The primitives an operator block writes through, under an identity of its own where it named
+     * one.
+     *
+     * <p>Never cached. A cached client would be handed to the next build that named the same
+     * credential -- a build whose right to use it was never checked -- and that is exactly the
+     * accidental widening this whole arrangement exists to prevent. Building it every time costs a
+     * handshake, and operator writes are rare enough to pay it.
+     *
+     * <p>Only the two fields a discas node authenticates on come from the credential. The cluster,
+     * TLS, the trust store and the poll period stay this controller's, so a block cannot quietly
+     * talk to somewhere else.
+     *
+     * @param listener   the run's log
+     * @param named      the environment the block named, or {@code null} for this controller's default
+     * @param clientId   the identity to connect as, or {@code null} to act as this controller
+     * @param credential what to authenticate with, or {@code null} to act as this controller
+     * @return the session, which the caller closes
+     * @throws AbortException if the controller has not been configured, or the combination is refused
+     */
+    synchronized OperatorSession operatorSessionFor(final TaskListener listener,
+                                                    final String named,
+                                                    final String clientId,
+                                                    final StandardCredentials credential)
+            throws AbortException {
+        if (credential == null) {
+            return new OperatorSession(piplexFor(listener, named), null);
+        }
         final Settings settings = applied;
+        if (!settings.tls()) {
+            // A discas node in allowall takes a client id as a claim rather than as a proof, so a
+            // second identity there separates nothing: anything that can reach the port can say it is
+            // piplex-ops. Refused rather than allowed to look like separation.
+            throw new AbortException("piplex: this block asks to act as '" + clientId + "', but this "
+                    + "controller connects without TLS, where a discas node takes a client id as a "
+                    + "claim rather than as a proof. A separate operator identity means something only "
+                    + "over token or mTLS");
+        }
+        // Everything refusable first, for the reason build() gives: a client made before them is one
+        // nobody holds and nobody closes, and this one carries its own event loop and connections.
+        final Environment in = environmentOf(named);
+        final Duration polling = watchPollPeriod(settings);
+        final TimeSource clock = time();
+        final ClientCredentials as = credentialsOf(credential, clientId);
+        final CoordinationStore own = new DiscasCoordinationStore(
+                client(settings, ClientId.of(clientId), as),
+                ReadConsistency.LINEARIZABLE, polling, true);
+        return new OperatorSession(
+                new Piplex(own, clock,
+                        new TextPiplexObserver(line -> listener.getLogger().println("piplex: " + line)),
+                        in),
+                own);
+    }
+
+    /**
+     * What a Jenkins credential authenticates a discas client with.
+     *
+     * @param credential the credential the block named, already resolved against the running build
+     * @param clientId   the identity it is being used for, for the sentence a refusal reads as
+     * @return the pair a discas node admits a client on
+     * @throws AbortException if the credential is of a kind a discas node does not admit clients on
+     */
+    private static ClientCredentials credentialsOf(final StandardCredentials credential,
+                                                   final String clientId) throws AbortException {
+        if (credential instanceof StandardCertificateCredentials certificate) {
+            final KeyStore store = certificate.getKeyStore();
+            checkNamed(store, clientId);
+            // The key password is not on the interface, only on the type the Jenkins UI creates. A
+            // store from anywhere else is tried without one, which is right for a store that has none
+            // and reports itself clearly when it has.
+            final Secret password = credential instanceof CertificateCredentialsImpl created
+                    ? created.getPassword()
+                    : null;
+            return new ClientCredentials(null, null, password, store);
+        }
+        if (credential instanceof StringCredentials token) {
+            return new ClientCredentials(token.getSecret(), null, null, null);
+        }
+        throw new AbortException("piplex: the credential for '" + clientId + "' is a "
+                + credential.getClass().getSimpleName() + ", and a discas node admits a client on a "
+                + "client certificate or a token. Use a Certificate credential for a cluster running "
+                + "--client-auth mtls, or a Secret text credential for one running --client-auth token");
+    }
+
+    /**
+     * Checks that the certificate a block will present is the identity the block claims.
+     *
+     * <p>Under mTLS the node authenticates a client on its certificate's common name, and the ACL is
+     * written against that name. {@code clientId} is a separate string, and nothing has ever made the
+     * two agree -- so a block naming one identity while presenting another is written down as the
+     * first and granted the rights of the second. Whichever of the two is wrong, acting is not the
+     * answer: the grant being claimed is not the grant that will be enforced.
+     *
+     * <p>Refused here rather than left to the node, because the node's refusal arrives as a denied
+     * key at whatever moment the job first writes one, and says nothing about why.
+     *
+     * @param store    the key store the credential carries
+     * @param clientId the identity the block names
+     * @throws AbortException if the store cannot be read, holds no certificate, or names somebody else
+     */
+    private static void checkNamed(final KeyStore store, final String clientId) throws AbortException {
+        final String common;
+        try {
+            common = commonNameOf(store);
+        } catch (final GeneralSecurityException unreadable) {
+            throw new AbortException("piplex: the certificate credential for '" + clientId + "' cannot "
+                    + "be read (" + unreadable.getMessage() + "), so the identity it would present "
+                    + "cannot be checked against that name");
+        }
+        if (common == null) {
+            throw new AbortException("piplex: the certificate credential for '" + clientId + "' has no "
+                    + "common name, and a discas node running --client-auth mtls admits a client on "
+                    + "exactly that. Issue the certificate with CN=" + clientId);
+        }
+        if (!common.equals(clientId)) {
+            throw new AbortException("piplex: this block acts as '" + clientId + "', but its credential "
+                    + "presents a certificate for '" + common + "'. A discas node grants the rights of "
+                    + "the certificate and this build would record the other name. Name the identity "
+                    + "the certificate carries, or use the credential issued to '" + clientId + "'");
+        }
+    }
+
+    /**
+     * @param store the key store the credential carries
+     * @return the common name of the certificate it would present, or {@code null} when it holds none
+     * @throws GeneralSecurityException if the store cannot be read
+     */
+    private static String commonNameOf(final KeyStore store) throws GeneralSecurityException {
+        final Enumeration<String> aliases = store.aliases();
+        while (aliases.hasMoreElements()) {
+            final String alias = aliases.nextElement();
+            // The key entry and no other: a store may also carry the CA it was signed by, and that
+            // certificate names the issuer rather than this client.
+            if (store.isKeyEntry(alias) && store.getCertificate(alias) instanceof X509Certificate leaf) {
+                return NodeIdentity.commonNameIn(leaf);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * One client, whoever it connects as.
+     *
+     * <p>Both the controller's store and an operator block's are built through here, so the cluster a
+     * client reaches, the rules about how credentials may be combined, and the sentence a refusal
+     * reads as are the same for either. What varies between them is the identity and the two fields
+     * it authenticates with, and nothing else.
+     *
+     * @param settings    the configuration in force
+     * @param identity    who to connect as
+     * @param credentials what to authenticate with
+     * @return the client, which whoever wraps it owns and closes
+     * @throws AbortException if no nodes are configured, or the combination is refused
+     */
+    private static DisCasClient client(final Settings settings, final ClientId identity,
+                                       final ClientCredentials credentials) throws AbortException {
         final Map<NodeId, InetSocketAddress> cluster = cluster(settings);
         if (cluster.isEmpty()) {
             throw new AbortException(
                     "piplex is not configured: set the discas nodes in Manage Jenkins > System");
         }
+        return DisCasClientFactory.create(
+                identity,
+                description(settings),
+                new TcpClientBootstrap(cluster, ClientTransportConfig.defaults(),
+                        plainText(credentials.token()), security(settings, credentials)),
+                DisCasClientConfig.defaults());
+    }
+
+    private void build() throws AbortException {
+        final Settings settings = applied;
         // Read before the client exists, because it can be refused: a client made first would be one
         // nobody holds a reference to and nobody closes.
         final Duration pollPeriod = watchPollPeriod(settings);
         final ClientId identity = ClientId.of(
                 settings.clientId() == null ? requireOwnerId() : settings.clientId());
-        final DisCasClient client = DisCasClientFactory.create(
-                identity,
-                description(settings),
-                new TcpClientBootstrap(cluster, ClientTransportConfig.defaults(),
-                        plainText(settings.token()), security(settings)),
-                DisCasClientConfig.defaults());
+        final DisCasClient client = client(settings, identity, ClientCredentials.of(settings));
         scheduler();
         // Watches read linearizably because what they return is acted on rather than re-read: the two
         // an admitted run holds revoke it on the value the watch itself returned, so a stale one stops
@@ -874,9 +1124,10 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * every {@code renewEvery} anyway, and a round always ends with a poll, so a period longer than
      * that round removes the polls inside it and leaves the two at its ends.
      *
-     * <p>What it costs is bounded by something else -- the gap taken is spread up to five times this,
-     * so an admitted run, which acts on what its own watch returned rather than reading again, hears
-     * of a designation moving or of a {@code disable} up to five periods late.
+     * <p>What it costs applies only while a candidate is parked: the gap taken is spread up to five
+     * times this, and the candidate reads all guards again at the end of each round. An admitted run
+     * keeps the discas client's own watch period because its answers revoke live work and must not be
+     * slowed by a background-poll setting.
      *
      * @return the period, or {@code null}
      * @throws AbortException if what was typed is not a duration, or is below discas' floor
@@ -940,13 +1191,27 @@ public final class PiplexConfiguration extends GlobalConfiguration {
     }
 
     private static ClientSecurityProvider security(final Settings settings) throws AbortException {
-        final Secret token = settings.token();
-        final String tlsKeystore = settings.tlsKeystore();
+        return security(settings, ClientCredentials.of(settings));
+    }
+    /**
+     * The combinations of TLS settings no client can be built from. Apart from {@link #security} so
+     * that a form can be refused on them, needing nothing off disk to judge.
+     *
+     * @param settings    what was filled in
+     * @param credentials the secrets among it
+     * @throws AbortException if no client can be built from the combination
+     */
+
+    private static void combinations(final Settings settings,
+                                     final ClientCredentials credentials)
+            throws AbortException {
+        final Secret token = credentials.token();
+        final boolean hasKeyStore = credentials.hasKeyStore();
         final String tlsTruststore = settings.tlsTruststore();
         if (!settings.tls()) {
             // Nothing is silently ignored: a store filled in with the box unticked is somebody who
             // believes this connection is encrypted, and it is not.
-            if (tlsKeystore != null || tlsTruststore != null) {
+            if (hasKeyStore || tlsTruststore != null) {
                 throw new AbortException("piplex: a TLS key store or trust store is configured but TLS "
                         + "is off. Tick 'Connect over TLS' in Manage Jenkins > System, or clear the "
                         + "stores");
@@ -961,9 +1226,9 @@ public final class PiplexConfiguration extends GlobalConfiguration {
                         + "cross the wire in clear on every connection. Tick 'Connect over TLS' in "
                         + "Manage Jenkins > System, or clear the token");
             }
-            return PlaintextClientSecurity.PROVIDER;
+            return;
         }
-        if (token != null && tlsKeystore != null) {
+        if (token != null && hasKeyStore) {
             // A discas node authenticates clients one way at a time -- `--client-auth token` or
             // `--client-auth mtls` -- so filling in both means one of them is not what the cluster is
             // running, and which one it is cannot be worked out from here. Two profiles are safe, and
@@ -985,27 +1250,39 @@ public final class PiplexConfiguration extends GlobalConfiguration {
                     + "the trust store also works, but with the check off it accepts every certificate "
                     + "that CA ever issues as a node, which is not pinning");
         }
+    }
+
+    private static ClientSecurityProvider security(final Settings settings,
+                                                   final ClientCredentials credentials)
+            throws AbortException {
+        combinations(settings, credentials);
+        final boolean hasKeyStore = credentials.hasKeyStore();
+        final String tlsTruststore = settings.tlsTruststore();
+        if (!settings.tls()) {
+            return PlaintextClientSecurity.PROVIDER;
+        }
         // Absent means the JVM's own trust store, which is what TrustManagerFactory does with a null
         // KeyStore. Right for a publicly signed node, wrong for the private CA most clusters use --
         // so it is a fallback and not a default worth recommending.
         final KeyStore trust = tlsTruststore == null
                 ? null
                 : pkcs12(tlsTruststore, settings.tlsTruststorePassword(), "trust store");
-        if (tlsKeystore == null) {
+        if (!hasKeyStore) {
             // Server-authenticated TLS: this controller checks the node and presents nothing of its
             // own. Enough under `--client-auth token`, never enough under `--client-auth mtls`.
             return TlsClientSecurityProvider.serverAuthOnly(
-                    TlsConfig.of(sslContext(settings, null, trust)));
+                    TlsConfig.of(sslContext(settings, null, null, trust)));
         }
         return new TlsClientSecurityProvider(TlsConfig.of(sslContext(settings,
-                pkcs12(tlsKeystore, settings.tlsKeystorePassword(), "key store"), trust)));
+                credentials.keyStore(), credentials.keyStorePassword(), trust)));
     }
 
     // discas wraps every failure here in a bare RuntimeException, so there is no narrower type to
     // catch. What it is worth catching for is the sentence: a key that the store's password does not
     // unlock is an operator error, and it should read as one rather than as a stack trace in a build
     // that was only trying to find out whether it may run.
-    private static SSLContext sslContext(final Settings settings, final KeyStore key, final KeyStore trust)
+    private static SSLContext sslContext(final Settings settings, final KeyStore key,
+                                         final Secret keyPassword, final KeyStore trust)
             throws AbortException {
         try {
             if (!settings.tlsVerifyNodeIdentity()) {
@@ -1014,9 +1291,9 @@ public final class PiplexConfiguration extends GlobalConfiguration {
                 // coarser one: the certificate is one of the few this controller was given.
                 return key == null
                         ? TlsContexts.buildTrustOnly(trust)
-                        : TlsContexts.build(key, password(settings.tlsKeystorePassword()), trust);
+                        : TlsContexts.build(key, password(keyPassword), trust);
             }
-            return boundToTheNodes(settings, key, trust);
+            return boundToTheNodes(settings, key, keyPassword, trust);
         } catch (final GeneralSecurityException | RuntimeException notUsable) {
             throw new AbortException("piplex: could not set up TLS from the configured stores: "
                     + rootCause(notUsable));
@@ -1031,14 +1308,16 @@ public final class PiplexConfiguration extends GlobalConfiguration {
      * before the context is initialised with them, and that is the only difference: the protocol is
      * {@link TlsContexts#PROTOCOL}, the same one every other discas connection uses.
      *
-     * @param settings the settings being built from
-     * @param key   this controller's own certificate, or {@code null} to present none
-     * @param trust what the nodes' certificates must chain to, or {@code null} for the JVM's own
+     * @param settings    the settings being built from
+     * @param key         the certificate to present, or {@code null} to present none
+     * @param keyPassword what unlocks the key in it, or {@code null} where it has none
+     * @param trust       what the nodes' certificates must chain to, or {@code null} for the JVM's own
      * @return the context
      * @throws GeneralSecurityException if the stores cannot be turned into managers
      * @throws AbortException           if no nodes are configured to check an identity against
      */
-    private static SSLContext boundToTheNodes(final Settings settings, final KeyStore key, final KeyStore trust)
+    private static SSLContext boundToTheNodes(final Settings settings, final KeyStore key,
+                                              final Secret keyPassword, final KeyStore trust)
             throws GeneralSecurityException, AbortException {
         final TrustManagerFactory trusted =
                 TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
@@ -1047,7 +1326,7 @@ public final class PiplexConfiguration extends GlobalConfiguration {
         if (key != null) {
             final KeyManagerFactory keys =
                     KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-            keys.init(key, password(settings.tlsKeystorePassword()));
+            keys.init(key, password(keyPassword));
             presented = keys.getKeyManagers();
         }
         final SSLContext context = SSLContext.getInstance(TlsContexts.PROTOCOL);

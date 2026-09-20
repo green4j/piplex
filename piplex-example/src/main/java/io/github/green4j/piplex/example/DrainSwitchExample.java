@@ -51,7 +51,8 @@ public final class DrainSwitchExample {
 
             Examples.say("=== Switch: turn the work off everywhere, including what is running ===");
 
-            final Admitted running = (Admitted) Examples.await(milan.runs().begin(request("new-day#901")));
+            final Admitted running = Examples.admitted(
+                    Examples.await(milan.runs().begin(request("new-day#901"))));
             Examples.say("Milan is running new-day, fencing token " + running.fencingToken());
 
             final CountDownLatch stopped = new CountDownLatch(1);

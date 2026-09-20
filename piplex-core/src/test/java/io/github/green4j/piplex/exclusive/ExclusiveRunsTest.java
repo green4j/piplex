@@ -75,8 +75,6 @@ class ExclusiveRunsTest {
         runs = new ExclusiveRuns(store, time);
     }
 
-    // ---- elected: whoever takes the lease runs -------------------------------------------------
-
     @Test
     void admitsExactlyOneOfTwoCandidates() {
         final Admission first = join(runs.begin(elected(BLUE).build()));
@@ -85,8 +83,6 @@ class ExclusiveRunsTest {
         assertInstanceOf(Admitted.class, first);
         assertEquals(BLUE + "/" + BLUE + "#1", assertInstanceOf(Admission.HeldByOther.class, second).heldBy());
     }
-
-    // ---- designated: an externally named owner --------------------------------------------------
 
     @ParameterizedTest
     @ValueSource(strings = {"somebody else", "nobody", "removed"})
@@ -127,8 +123,6 @@ class ExclusiveRunsTest {
         assertInstanceOf(Admitted.class, join(asked), "The next round reads in time");
         assertEquals(List.of("admitted"), told);
     }
-
-    // ---- active: an external key names the site allowed to run ---------------------------------
 
     @Test
     void admitsARunWhileTheActiveKeyHoldsItsValue() {
@@ -250,8 +244,6 @@ class ExclusiveRunsTest {
         assertEquals(Revocation.Reason.GUARD_UNREACHABLE, seen.get(0).reason());
         assertTrue(seen.get(0).detail().contains(ACTIVE), "Was: " + seen.get(0));
     }
-
-    // ---- the work is already done ---------------------------------------------------------------
 
     @ParameterizedTest
     @CsvSource({"2026-09-11, false", "2026-09-12, true", "2026-09-13, true"})
@@ -376,8 +368,6 @@ class ExclusiveRunsTest {
         assertEquals("No route to the cluster", unread.getSuppressed()[0].getMessage());
     }
 
-    // ---- the switch -----------------------------------------------------------------------------
-
     static List<String> switchesThatStopBlue() {
         return List.of(KEY, Switches.ownerKey(KEY, BLUE));
     }
@@ -394,8 +384,6 @@ class ExclusiveRunsTest {
                 join(runs.begin(elected(GREEN).enabledBy(KEY).build())) instanceof Admission.Disabled,
                 "Switching one owner off leaves the others on");
     }
-
-    // ---- completing -----------------------------------------------------------------------------
 
     @Test
     void publishesTheMilestoneBeforeItGivesTheLeaseBack() {
@@ -505,8 +493,6 @@ class ExclusiveRunsTest {
         gate.complete(null);
         assertEquals(PublishResult.Outcome.PUBLISHED, join(first).outcome());
     }
-
-    // ---- handover while a run is in flight ------------------------------------------------------
 
     @Test
     void revokesTheHolderWhenTheDesignationChanges() {
@@ -741,8 +727,6 @@ class ExclusiveRunsTest {
         assertEquals(1, seen.size(), "Registering after the fact must not lose the notification");
     }
 
-    // ---- parking ends for other reasons too -----------------------------------------------------
-
     @Test
     void stopsParkingWhenTheWorkGetsDoneElsewhere() {
         designate(BLUE);
@@ -772,8 +756,6 @@ class ExclusiveRunsTest {
         assertTrue(parked.isDone());
         assertInstanceOf(Admission.NotDesignated.class, parked.join());
     }
-
-    // ---- the lease underneath -------------------------------------------------------------------
 
     @Test
     void keepsTheLeaseAliveWhileTheRunLasts() {
@@ -922,8 +904,6 @@ class ExclusiveRunsTest {
         assertEquals(Revocation.Reason.LEASE_LOST, seen.get(0).reason());
         assertNull(seen.get(0).detail(), "A refusal is definite, and has nothing to add to the reason");
     }
-
-    // ---- a guard which stops making sense ------------------------------------------------------
 
     static List<String> keysARunWatches() {
         return List.of(Designations.keyOf(Environment.DEFAULT, KEY), Switches.keyOf(Environment.DEFAULT, KEY));
@@ -1388,8 +1368,6 @@ class ExclusiveRunsTest {
                 "The lease taken a moment before must not be left to lapse");
     }
 
-    // ---- an ask nobody is waiting on any more ----------------------------------------------------
-
     @Test
     void stopsParkingWhenNobodyIsWaitingForTheAnswerAnyMore() {
         designate(BLUE);
@@ -1488,8 +1466,6 @@ class ExclusiveRunsTest {
         time.advance(LEASE.multipliedBy(3));
         assertTrue(retried.isHeld(), "And the retry goes on renewing it");
     }
-
-    // ---- helpers --------------------------------------------------------------------------------
 
     @Test
     void answersAStoreThatThrowsWithAFailedStage() {

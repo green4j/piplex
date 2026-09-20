@@ -286,7 +286,11 @@ final class NodeIdentity extends X509ExtendedTrustManager {
         return names;
     }
 
-    private static String commonNameIn(final X509Certificate leaf) {
+    /**
+     * @param leaf the certificate
+     * @return the CN of its subject, or {@code null} when it has none
+     */
+    static String commonNameIn(final X509Certificate leaf) {
         try {
             for (final Rdn rdn : new LdapName(leaf.getSubjectX500Principal().getName()).getRdns()) {
                 if ("cn".equalsIgnoreCase(rdn.getType())) {

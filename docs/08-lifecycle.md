@@ -33,15 +33,27 @@ The plugin is installed from a release `.hpi`, not an update centre.
 1. Drain or hand over work. To move one key:
 
    ```groovy
-   piplex.designations()
-         .designate('eod-owner', 'euc1-green', 'plugin upgrade')
-         .toCompletableFuture().join()
+   withPiplexOperator {
+       piplexDesignate key: 'eod-owner', owner: 'euc1-green', reason: 'plugin upgrade'
+   }
    ```
 
    To stop all owners instead:
 
    ```groovy
-   piplex.switches().disable('eod-switch', 'plugin upgrade').toCompletableFuture().join()
+   withPiplexOperator {
+       piplexSwitch key: 'eod-switch', enabled: false, reason: 'plugin upgrade'
+   }
+   ```
+
+   To take one controller out instead, run this on that controller, which waits for work already
+   running there to stop:
+
+   ```groovy
+   withPiplexOperator {
+       piplexSwitch key: 'eod-switch', enabled: false, ownerId: 'euc1-blue',
+                    reason: 'plugin upgrade', drainTimeout: '30m'
+   }
    ```
 
 2. Wait for guarded builds to finish or confirm they were revoked.
@@ -72,16 +84,6 @@ roll back automatically.
 A lease left by the removed process lapses within its configured term. Do not edit
 `piplex/<environment>/exclusive/<key>` to accelerate it.
 
-#### Compatibility with older key formats
-
-Older installations may store a per-owner switch as `<key>/<ownerId>` rather than the current
-`<key>/@<ownerId>`. Upgrade and rollback do not move that state; reissue any active drain under the
-format read by the installed plugin.
-
-Lease identity now escapes `/` and `\` inside its owner, run and execution components. A resumed run
-whose older identity contained either character may not recognise the lease it left and will wait for
-that lease to lapse before acquiring normally. Identities without those characters are unchanged.
-
 ### Upgrade discas
 
 Treat the cluster and every plugin client as one compatibility unit:
@@ -89,7 +91,9 @@ Treat the cluster and every plugin client as one compatibility unit:
 1. Disable each affected work key and wait for completion:
 
    ```groovy
-   piplex.switches().disable('eod-switch', 'discas upgrade').toCompletableFuture().join()
+   withPiplexOperator {
+       piplexSwitch key: 'eod-switch', enabled: false, reason: 'discas upgrade'
+   }
    ```
 
 2. Wait at least the longest lease term so no run can still act under an old lease.
@@ -99,7 +103,9 @@ Treat the cluster and every plugin client as one compatibility unit:
 6. Re-enable each key and run a build:
 
    ```groovy
-   piplex.switches().enable('eod-switch').toCompletableFuture().join()
+   withPiplexOperator {
+       piplexSwitch key: 'eod-switch', enabled: true
+   }
    ```
 
 Skipping the drain does not migrate or corrupt records, but turns the version mismatch into aborted
@@ -145,24 +151,17 @@ Do not write a token directly into the exclusive key.
 ### Repair an unreadable value
 
 Normal operator methods first parse the current value and therefore cannot replace malformed JSON.
-Use the explicit repair methods:
+From Jenkins this is the `OVERWRITE_UNREADABLE` parameter of the job that owns the key -- see
+[6. A key holds something nothing can parse](06-operations.md#6-a-key-holds-something-nothing-can-parse),
+which is the route to use, and the only one from a pipeline: the methods behind it --
+`Designations.repair`, `Switches.repair` and `Milestones.repair` -- are core Java, reachable from a
+host embedding the library but from no Jenkinsfile.
 
-```groovy
-import io.github.green4j.piplex.Generation
-
-piplex.designations()
-      .repair('eod-owner', 'euc1-blue', 'INC-4821')
-      .toCompletableFuture().join()
-piplex.switches()
-      .repair('eod-switch', true, null)
-      .toCompletableFuture().join()
-piplex.milestones()
-      .repair('data/euc1', Generation.of('2026-09-14'))
-      .toCompletableFuture().join()
-```
-
-Repair replaces an unreadable record with the supplied state. A repaired designation restarts its
-sequence at 1; a milestone moves to exactly the supplied generation. Derive both from evidence.
+Repair replaces an unreadable record with the supplied state, and does nothing else. Against a
+readable record each behaves exactly as its ordinary counterpart, monotonicity included: a milestone
+already at or ahead of the generation given is kept, so this is not a way to move one backwards.
+Having replaced an unreadable record, a designation restarts its sequence at 1 and a milestone sits at
+exactly the generation supplied. Derive both from evidence.
 
 Deleting a key is not equivalent to repair: an absent designation means nobody, while an absent switch
 means enabled.
@@ -178,4 +177,4 @@ Piplex stores no history or authoritative audit trail. It cannot reconstruct:
 
 Keep operational history in Jenkins and aggregated logs, and make protected work fenced or idempotent.
 
-Previous: [7. discas and security](07-discas.md) · [Documentation index](README.md)
+Previous: [7. discas and security](07-discas.md) · Next: [9. Deployment](09-deployment.md) · [Documentation index](README.md)

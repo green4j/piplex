@@ -99,6 +99,68 @@ final class KeyStores {
         return file;
     }
 
+    /**
+     * A store vouching for a certificate somebody else holds the key to.
+     *
+     * <p>What the other side of a TLS connection needs, and what {@link #trustStoreHolding} cannot
+     * give it: that one mints a key of its own, so the two sides trust different certificates.
+     *
+     * @param directory where to write it
+     * @param from      the key store holding the certificate to vouch for
+     * @param alias     its alias in that store, and in this one
+     * @param password  both stores' password
+     * @return the file written
+     * @throws Exception if keytool cannot be run
+     */
+    static Path trustStoreFor(final Path directory,
+                              final Path from,
+                              final String alias,
+                              final String password) throws Exception {
+        final Path certificate = directory.resolve(alias + "-exported.pem");
+        run(List.of(keytool().toString(), "-exportcert", "-rfc",
+                "-alias", alias, "-keystore", from.toString(), "-storepass", password,
+                "-file", certificate.toString()));
+
+        final Path file = directory.resolve(alias + "-trusted.p12");
+        run(List.of(keytool().toString(), "-importcert", "-noprompt",
+                "-alias", alias, "-file", certificate.toString(),
+                "-storetype", "PKCS12", "-keystore", file.toString(), "-storepass", password));
+        return file;
+    }
+
+    /**
+     * One store vouching for the certificates of several key stores.
+     *
+     * <p>What a node running {@code --client-auth mtls} needs: every controller and the operations
+     * identity hold their own certificate, and the node takes a client certificate from any of them.
+     *
+     * @param directory where to write it
+     * @param name      what to call it
+     * @param password  every store's password, including this one
+     * @param aliases   the alias of each store to vouch for, which is also its alias here
+     * @param from      the key store holding each, in the same order
+     * @return the file written
+     * @throws Exception if keytool cannot be run
+     */
+    static Path trustStoreOf(final Path directory,
+                             final String name,
+                             final String password,
+                             final List<String> aliases,
+                             final List<Path> from) throws Exception {
+        final Path file = directory.resolve(name + ".p12");
+        for (int i = 0; i < aliases.size(); i++) {
+            final String alias = aliases.get(i);
+            final Path certificate = directory.resolve(name + "-" + alias + ".pem");
+            run(List.of(keytool().toString(), "-exportcert", "-rfc",
+                    "-alias", alias, "-keystore", from.get(i).toString(), "-storepass", password,
+                    "-file", certificate.toString()));
+            run(List.of(keytool().toString(), "-importcert", "-noprompt",
+                    "-alias", alias, "-file", certificate.toString(),
+                    "-storetype", "PKCS12", "-keystore", file.toString(), "-storepass", password));
+        }
+        return file;
+    }
+
     static X509Certificate certificateIn(final Path file,
                                          final String password,
                                          final String alias) throws Exception {

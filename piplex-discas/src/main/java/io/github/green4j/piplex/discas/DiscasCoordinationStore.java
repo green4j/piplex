@@ -33,6 +33,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
@@ -184,7 +185,22 @@ public final class DiscasCoordinationStore implements CoordinationStore {
     public CompletionStage<LeaseAttempt> tryAcquire(final String key,
                                                     final String ownerId,
                                                     final Duration ttl) {
-        return open(() -> attempt(key, ownerId, ttl, true));
+        return open(() -> attempt(key, ownerId, ttl, true), taken -> giveBack(key, taken));
+    }
+
+    /**
+     * Gives back a lease granted after the store closed. Its token is kept only in the answer nobody
+     * took, so dropped it stands until the term lapses with nothing able to end it early.
+     *
+     * <p>Best effort: a store that owns its client has closed it by now, and the lease then lapses.
+     *
+     * @param key   what was taken
+     * @param taken what the acquire answered
+     */
+    private void giveBack(final String key, final LeaseAttempt taken) {
+        if (taken instanceof LeaseAttempt.Acquired acquired) {
+            release(key, DiscasLeaseHandle.tokenOf(acquired.handle()), true);
+        }
     }
 
     @Override
@@ -268,6 +284,19 @@ public final class DiscasCoordinationStore implements CoordinationStore {
      * @return its answer, or a failure once the store is closed
      */
     private <T> CompletionStage<T> open(final Supplier<CompletionStage<T>> call) {
+        return open(call, answered -> { });
+    }
+
+    /**
+     * As above, saying what to do with an answer nobody is left to take.
+     *
+     * @param call     the call to make
+     * @param orphaned given the answer when the store closed before it arrived
+     * @param <T>      what it answers with
+     * @return its answer, or a failure once the store is closed
+     */
+    private <T> CompletionStage<T> open(final Supplier<CompletionStage<T>> call,
+                                        final Consumer<T> orphaned) {
         if (closed.get()) {
             return CompletableFuture.failedFuture(closedStore());
         }
@@ -289,8 +318,9 @@ public final class DiscasCoordinationStore implements CoordinationStore {
         made.whenComplete((value, error) -> {
             if (error != null) {
                 answer.completeExceptionally(error);
-            } else {
-                answer.complete(value);
+            } else if (!answer.complete(value)) {
+                // close() got here first, so this reached nobody. Most answers cost nothing to drop.
+                orphaned.accept(value);
             }
         });
         return answer;

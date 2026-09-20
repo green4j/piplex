@@ -7,8 +7,14 @@
 
 package io.github.green4j.piplex.jenkins;
 
+import com.google.common.util.concurrent.ListenableFuture;
 import hudson.AbortException;
+import hudson.model.Result;
 import io.github.green4j.piplex.exclusive.Revocation;
+import org.jenkinsci.plugins.workflow.steps.BodyExecution;
+import org.jenkinsci.plugins.workflow.steps.BodyInvoker;
+import org.jenkinsci.plugins.workflow.steps.StepContext;
+import org.jenkinsci.plugins.workflow.steps.StepExecution;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
@@ -34,14 +40,18 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Collection;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -142,6 +152,38 @@ class StateFixturesTest {
         final PiplexOwnership ownership = (PiplexOwnership) deserialize(read(1, "ownership.ser"));
         assertEquals("eod", ownership.key());
         assertEquals(OWNERSHIP_ID, field(ownership, "id"));
+    }
+
+    /**
+     * A controller that went down between the body ending and the release coming back, brought up on a
+     * plugin older than the one that wrote the state down.
+     *
+     * <p>Both halves are refusals, and the order they are read in is the whole of it. What the body did
+     * was written down precisely so the context can be answered for it; a refusal that only cancels
+     * cancels a body which ended before the restart -- no callback, no answer, and a build that waits
+     * for one for ever with the step still counted as running.
+     */
+    @Test
+    void answersForAnEndedBodyEvenWhenTheStateIsFromANewerPlugin() throws Exception {
+        final ExclusiveStepExecution ended = sample();
+        set(ended, "stateVersion", ExclusiveStepExecution.STATE_VERSION + 1);
+        set(ended, "bodyEnded", true);
+        final AbortException failure = new AbortException("The body failed while holding 'eod'");
+        set(ended, "bodyFailure", failure);
+        // The body is over: Jenkins replays nothing, and cancelling it calls nobody back.
+        final EndedBody body = new EndedBody();
+        set(ended, "body", body);
+        final Answer answer = new Answer();
+        setOn(StepExecution.class, ended, "context", answer);
+
+        ended.onResume();
+
+        assertSame(failure, answer.given.get(),
+                "The step must answer the context with what the body did, not wait to be cancelled");
+        assertFalse(body.cancelled,
+                "A body that has already ended hears no cancel -- its callback ran before the restart");
+        assertFalse(inFlight().contains(ended),
+                "A step that has answered must not go on being counted as running");
     }
 
     /**
@@ -334,5 +376,113 @@ class StateFixturesTest {
         final Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);
         field.set(target, value);
+    }
+
+    private static void setOn(final Class<?> type, final Object target, final String name,
+                              final Object value) throws Exception {
+        final Field field = type.getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(target, value);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<ExclusiveStepExecution> inFlight() throws Exception {
+        final Field field = ExclusiveStepExecution.class.getDeclaredField("IN_FLIGHT");
+        field.setAccessible(true);
+        return (Set<ExclusiveStepExecution>) field.get(null);
+    }
+
+    /** What the step was answered with, which is the whole question here. */
+    private static final class Answer extends StepContext {
+
+        private final AtomicReference<Throwable> given = new AtomicReference<>();
+
+        @Override
+        public void onFailure(final Throwable cause) {
+            given.set(cause);
+        }
+
+        @Override
+        public void onSuccess(final Object value) {
+            given.set(new IllegalStateException("Answered well, though the body failed"));
+        }
+
+        @Override
+        public <T> T get(final Class<T> type) {
+            return null;
+        }
+
+        @Override
+        public boolean isReady() {
+            return true;
+        }
+
+        @Override
+        public ListenableFuture<Void> saveState() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void setResult(final Result result) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public BodyInvoker newBodyInvoker() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean equals(final Object other) {
+            return this == other;
+        }
+
+        @Override
+        public int hashCode() {
+            return System.identityHashCode(this);
+        }
+    }
+
+    /** A body whose callback ran before the controller went down, so cancelling it calls nobody. */
+    private static final class EndedBody extends BodyExecution {
+
+        private boolean cancelled;
+
+        @Override
+        public Collection<StepExecution> getCurrentExecutions() {
+            return List.of();
+        }
+
+        @Override
+        public boolean cancel(final Throwable cause) {
+            cancelled = true;
+            return false;
+        }
+
+        @Override
+        public boolean cancel(final boolean mayInterrupt) {
+            cancelled = true;
+            return false;
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return cancelled;
+        }
+
+        @Override
+        public boolean isDone() {
+            return true;
+        }
+
+        @Override
+        public Object get() {
+            return null;
+        }
+
+        @Override
+        public Object get(final long timeout, final java.util.concurrent.TimeUnit unit) {
+            return null;
+        }
     }
 }

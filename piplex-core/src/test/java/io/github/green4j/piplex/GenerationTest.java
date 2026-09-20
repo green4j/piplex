@@ -21,6 +21,8 @@ class GenerationTest {
     @Test
     void refusesAGenerationWithNothingInIt() {
         assertThrows(IllegalArgumentException.class, () -> Generation.of(""));
+        // Compared as text, so one made of spaces sorts below every real value and releases nobody.
+        assertThrows(IllegalArgumentException.class, () -> Generation.of("   "));
         assertThrows(NullPointerException.class, () -> Generation.of(null));
     }
 

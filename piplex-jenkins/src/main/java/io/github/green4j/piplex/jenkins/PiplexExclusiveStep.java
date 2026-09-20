@@ -235,5 +235,13 @@ public final class PiplexExclusiveStep extends Step {
         public Set<? extends Class<?>> getRequiredContext() {
             return Set.of(Run.class, TaskListener.class);
         }
+
+        @Override
+        public Set<? extends Class<?>> getProvidedContext() {
+            // Declared so that a step needing it is refused, outside this block, with a message
+            // naming the block rather than the class that happened to be missing. The refusal works
+            // either way; what this buys is that it reads as instructions.
+            return Set.of(PiplexOwnership.class);
+        }
     }
 }

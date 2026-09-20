@@ -45,10 +45,14 @@ class DesignationsTest {
 
     @Test
     void hasNobodyDesignatedUntilSomebodyIsAndRefusesToDesignateNobody() {
-        // Null and not a record standing for nobody: "not designated yet" and "designated to nobody"
-        // would otherwise be the same value, and only the first of them is a state this has.
-        assertThrows(NullPointerException.class, () -> designations.designate(KEY, null, "INC-4821"));
-        assertNull(join(designations.current(KEY)), "And it never reached the store");
+        // Refused and not written as a record standing for nobody: "not designated yet" and
+        // "designated to nobody" would otherwise be the same value, and only the first of them is a
+        // state this has. Blank refused like null, and for the sterner reason: a blank owner reaches
+        // the store, is read by every candidate, and stands them all down.
+        assertThrows(IllegalArgumentException.class, () -> designations.designate(KEY, null, "INC-4821"));
+        assertThrows(IllegalArgumentException.class, () -> designations.designate(KEY, "  ", "INC-4821"));
+        assertThrows(IllegalArgumentException.class, () -> designations.repair(KEY, "", "INC-4821"));
+        assertNull(join(designations.current(KEY)), "And none of them reached the store");
     }
 
     @Test

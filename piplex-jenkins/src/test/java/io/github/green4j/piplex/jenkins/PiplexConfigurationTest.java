@@ -353,6 +353,34 @@ class PiplexConfigurationTest {
     }
 
     @Test
+    void refusesATlsCombinationOnTheFormRatherThanOnTheNextBuild(final JenkinsRule jenkins) {
+        final PiplexConfiguration configuration = PiplexConfiguration.get();
+        configuration.setOwnerId("euc1-blue");
+        configuration.setNodes("n1=10.0.0.1:7101");
+
+        // Unticking TLS does not post the fields the closed block holds, so a trust store set earlier
+        // survives. Left to the first build, this saves green and then fails every job on the
+        // controller, naming a field the closed block hides.
+        final StaplerRequest2 request = (StaplerRequest2) Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[] {StaplerRequest2.class},
+                (proxy, method, args) -> {
+                    if (!method.getName().equals("bindJSON")) {
+                        throw new UnsupportedOperationException(method.getName());
+                    }
+                    configuration.setTls(false);
+                    configuration.setTlsTruststore("/etc/piplex/trust.p12");
+                    return null;
+                });
+
+        final FormException refused = assertThrows(FormException.class,
+                () -> configuration.configure(request, new JSONObject()));
+
+        assertEquals("tls", refused.getFormField());
+        assertTrue(refused.getMessage().contains("TLS is off"), refused.getMessage());
+        assertNull(configuration.getTlsTruststore(), "The whole form is refused, not just the field");
+    }
+
+    @Test
     void namesTheFieldARefusedFormGotWrong(final JenkinsRule jenkins) {
         final PiplexConfiguration configuration = PiplexConfiguration.get();
         configuration.setOwnerId("euc1-blue");

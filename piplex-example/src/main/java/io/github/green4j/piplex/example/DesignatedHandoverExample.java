@@ -69,8 +69,8 @@ public final class DesignatedHandoverExample {
             Examples.say("Designated " + initial.inForce().owner() + ", change #" + initial.inForce().seq());
 
             // Frankfurt is designated, so it runs.
-            final Admitted holder = (Admitted) Examples.await(
-                    frankfurt.runs().begin(request("euc1-blue", "eod#142", today)));
+            final Admitted holder = Examples.admitted(Examples.await(
+                    frankfurt.runs().begin(request("euc1-blue", "eod#142", today))));
             Examples.say("Frankfurt is running EOD, fencing token " + holder.fencingToken());
 
             final CountDownLatch revoked = new CountDownLatch(1);
@@ -109,7 +109,7 @@ public final class DesignatedHandoverExample {
         // Frankfurt's work has stopped, so its lease can go back and Milan need not wait it out.
         Examples.await(holder.release());
 
-        final Admitted taken = (Admitted) Examples.await(milanAsked);
+        final Admitted taken = Examples.admitted(Examples.await(milanAsked));
         Examples.say("Milan stopped waiting and is running EOD, fencing token " + taken.fencingToken());
 
         // The milestone is published on success and only on success. Frankfurt's half-finished run

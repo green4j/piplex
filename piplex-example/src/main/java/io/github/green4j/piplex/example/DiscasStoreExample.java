@@ -7,7 +7,6 @@
 
 package io.github.green4j.piplex.example;
 
-import io.github.green4j.discas.client.DisCasClient;
 import io.github.green4j.discas.client.DisCasClientFactory;
 import io.github.green4j.discas.client.transport.TcpClientBootstrap;
 import io.github.green4j.discas.common.client.ClientTransportConfig;
@@ -72,13 +71,14 @@ public final class DiscasStoreExample {
         final ClientId clientId = ClientId.of(args[0]);
         final String key = args[1];
 
-        final DisCasClient client = DisCasClientFactory.create(
-                clientId, new TcpClientBootstrap(nodes(args), ClientTransportConfig.defaults()));
-
-        // The store owns the client from here: closing one closes the other, so a caller cannot leave
-        // a connection behind by forgetting which of the two it was holding.
+        // The store owns the client: closing one closes the other, so a caller cannot leave a
+        // connection behind by forgetting which of the two it was holding. Made inside the resource
+        // list, because a client made before it is one nobody holds a reference to if what comes next
+        // throws -- and it is a thread and a set of connections to the cluster.
         try (CoordinationStore store = new DiscasCoordinationStore(
-                client, ReadConsistency.LINEARIZABLE, true);
+                DisCasClientFactory.create(clientId,
+                        new TcpClientBootstrap(nodes(args), ClientTransportConfig.defaults())),
+                ReadConsistency.LINEARIZABLE, true);
                 Controllers controllers = new Controllers(store)) {
 
             final Piplex piplex = controllers.controller(clientId.value());

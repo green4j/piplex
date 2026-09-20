@@ -25,24 +25,40 @@ final class Durations {
      * @param text     what was typed, or {@code null} or blank for the fallback
      * @param fallback what a missing value means
      * @param what     the parameter's name, for the message when it is wrong
-     * @return the duration
+     * @return the duration, which must be positive
      */
     static Duration parse(final String text, final Duration fallback, final String what) {
+        return parse(text, fallback, what, false);
+    }
+
+    /**
+     * @param text what was typed, or {@code null} or blank for none
+     * @param what the parameter's name, for the message when it is wrong
+     * @return the duration, where zero is a value and not a mistake -- written out, it asks for what
+     *         leaving the field unset already means
+     */
+    static Duration orZero(final String text, final String what) {
+        return parse(text, Duration.ZERO, what, true);
+    }
+
+    private static Duration parse(final String text, final Duration fallback, final String what,
+                                  final boolean zeroAllowed) {
         if (text == null || text.isBlank()) {
             return fallback;
         }
         final String trimmed = text.trim();
-        final Duration parsed = suffixed(trimmed);
-        if (parsed != null) {
-            return positive(parsed, trimmed, what);
-        }
+        final Duration parsed;
         try {
-            return positive(Duration.parse(trimmed), trimmed, what);
+            final Duration suffixed = suffixed(trimmed);
+            parsed = suffixed != null ? suffixed : Duration.parse(trimmed);
         } catch (final RuntimeException notADuration) {
+            // A number too large to be one lands here too, and says so as a typo rather than as an
+            // overflow from inside the parser, which names nothing the operator typed.
             throw new IllegalArgumentException(
                     what + ": expected something like '90m', '4h' or 'PT1H30M', got '" + trimmed + "'",
                     notADuration);
         }
+        return inRange(parsed, trimmed, what, zeroAllowed);
     }
 
     private static Duration suffixed(final String text) {
@@ -61,9 +77,11 @@ final class Durations {
         }
     }
 
-    private static Duration positive(final Duration value, final String text, final String what) {
-        if (value.isNegative() || value.isZero()) {
-            throw new IllegalArgumentException(what + ": must be positive, got '" + text + "'");
+    private static Duration inRange(final Duration value, final String text, final String what,
+                                    final boolean zeroAllowed) {
+        if (value.isNegative() || (value.isZero() && !zeroAllowed)) {
+            throw new IllegalArgumentException(what + ": must be "
+                    + (zeroAllowed ? "zero or more" : "positive") + ", got '" + text + "'");
         }
         return value;
     }

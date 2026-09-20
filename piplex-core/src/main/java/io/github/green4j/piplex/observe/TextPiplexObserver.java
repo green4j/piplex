@@ -186,9 +186,16 @@ public final class TextPiplexObserver implements PiplexObserver {
         }
 
         private Line put(final String name, final Object value) {
-            if (value != null) {
-                text.append(' ').append(name).append('=').append(quoted(value.toString()));
+            if (value == null) {
+                return this;
             }
+            final String written = value.toString();
+            // An empty one is a field with nothing in it too, and it is what the shipped operator jobs
+            // send whenever nobody typed a change reference. Written, it is a dangling "reason=".
+            if (written.isEmpty()) {
+                return this;
+            }
+            text.append(' ').append(name).append('=').append(quoted(written));
             return this;
         }
 

@@ -99,6 +99,35 @@ class ExclusiveRequestTest {
         assertTrue(refused.getMessage().startsWith("key"), refused.getMessage());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+        "ownerId",
+        "runId",
+        "executionId",
+        "designatedBy",
+        "enabledBy",
+        "completedWhen",
+    })
+    void refusesEveryOtherNameItWouldTurnIntoAKey(final String field) {
+        // The key builders refuse these too, but mid-admission and naming neither the request nor the
+        // field. A blank ownerId is not caught even there: it composes the identity "/<runId>".
+        final IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> blank(field).build());
+        assertTrue(refused.getMessage().startsWith(field), refused.getMessage());
+    }
+
+    private static ExclusiveRequest.Builder blank(final String field) {
+        return switch (field) {
+            case "ownerId" -> ExclusiveRequest.builder(KEY).ownedBy(" ").runId(RUN);
+            case "runId" -> ExclusiveRequest.builder(KEY).ownedBy(OWNER).runId(" ");
+            case "executionId" -> builder().executionId(" ");
+            case "designatedBy" -> builder().designatedBy(" ");
+            case "enabledBy" -> builder().enabledBy(" ");
+            case "completedWhen" -> builder().completedWhen(" ").generation(Generation.of("2026-09-14"));
+            default -> throw new IllegalArgumentException(field);
+        };
+    }
+
     // A runId is a build's externalizable id, and a build in a folder carries the folder in it -- so the
     // delimiter is a character the parts may contain, and so is the escape character. Joined without
     // escaping both, two holders would spell their identity one way and share one lease.

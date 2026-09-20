@@ -18,7 +18,7 @@ import java.util.Objects;
  * on the caller: {@code "10"} sorts before {@code "9"}, so a bare counter must be zero-padded.
  * {@link #ofDate} is safe by construction, because ISO-8601 orders the same way as time does.
  *
- * @param value the generation, never empty
+ * @param value the generation, never blank
  */
 public record Generation(String value) implements Comparable<Generation> {
 
@@ -27,8 +27,10 @@ public record Generation(String value) implements Comparable<Generation> {
      */
     public Generation {
         Objects.requireNonNull(value, "value");
-        if (value.isEmpty()) {
-            throw new IllegalArgumentException("generation must not be empty");
+        // Blank, not just empty: generations are compared as text, so one made of spaces sorts below
+        // every real value and is published as a milestone that releases nobody.
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("generation must not be blank");
         }
     }
 

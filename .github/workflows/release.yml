@@ -25,7 +25,7 @@ jobs:
       contents: read
 
   build:
-    name: Build the .hpi
+    name: Build release assets
     needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -68,32 +68,100 @@ jobs:
       - name: Build, test and package
         shell: bash
         run: |
-          ./gradlew --no-daemon --stacktrace clean build :piplex-jenkins:jpi
+          ./gradlew --no-daemon --stacktrace clean build :piplex-jenkins:jpi :piplex-init:jar
           mv "piplex-jenkins/build/libs/piplex-${{ steps.version.outputs.version }}.hpi" .
+
+      # The tool that prepares a deployment, the job templates it fills in, and the procedure.
+      # Released beside the .hpi rather than left to be fetched from the repository, because these
+      # jobs call steps whose parameters move between versions: a handover job from another release
+      # is one that fails during the incident it was needed for. Shipping them together is what
+      # makes the pair explicit.
+      #
+      # piplex-init.jar carries the same templates on its classpath and is the only supported way to
+      # use them; jobs/ is in the archive so they can be read without unpacking a jar. The launchers
+      # keep the command stable and find Java through JAVA_HOME, then PATH.
+      #
+      # No ACL files. The tool writes the ACL, and three more that must not be copied would be an
+      # invitation to copy one.
+      #
+      # DEPLOY.md is the chapter itself, copied rather than written twice.
+      - name: Assemble the operator archive
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          root="piplex-operator-${version}"
+          jobs="piplex-init/src/main/resources/jobs"
+          if [[ ! -d "${jobs}" || -z "$(ls -A "${jobs}")" ]]; then
+            echo "${jobs} is missing or empty, and there is nothing for piplex-init to fill in"
+            exit 1
+          fi
+          if [[ ! -f docs/09-deployment.md ]]; then
+            echo "docs/09-deployment.md is missing; DEPLOY.md is a copy of it, not a second copy"
+            exit 1
+          fi
+          init="piplex-init/build/libs/piplex-init-${version}.jar"
+          if [[ ! -f "${init}" ]]; then
+            echo "${init} is missing, and it is what prepares everything else in this archive"
+            exit 1
+          fi
+          launchers="piplex-init/src/main/dist"
+          if [[ ! -f "${launchers}/piplex-init" || ! -f "${launchers}/piplex-init.cmd" ]]; then
+            echo "${launchers} does not contain both piplex-init launchers"
+            exit 1
+          fi
+          mkdir -p "${root}"
+          cp -R "${jobs}" "${root}/jobs"
+          cp "${init}" "${root}/piplex-init.jar"
+          cp "${launchers}/piplex-init" "${launchers}/piplex-init.cmd" "${root}/"
+          chmod 0755 "${root}/piplex-init"
+          cp docs/09-deployment.md "${root}/DEPLOY.md"
+          zip -r -q "${root}.zip" "${root}"
+          unzip -l "${root}.zip"
+
+      - name: Verify the operator archive
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          root="piplex-operator-${version}"
+          unpacked="$(mktemp -d)"
+          trap 'rm -rf "${unpacked}"' EXIT
+          unzip -q "${root}.zip" -d "${unpacked}"
+          test -x "${unpacked}/${root}/piplex-init"
+          test -f "${unpacked}/${root}/piplex-init.cmd"
+          "${unpacked}/${root}/piplex-init" --help
+          env -u JAVA_HOME "${unpacked}/${root}/piplex-init" --help
 
       # What an operator checks before installing, and the only thing that makes "the same bytes on
       # every controller" checkable rather than asserted. sha256sum's own format, so `sha256sum -c` on
       # the downloaded pair is the whole verification. Written here, beside the bytes it describes, and
       # checked again in the job that publishes them.
+      #
+      # The operator archive is checksummed on the same terms as the plugin. It holds a tool that
+      # writes an ACL and jobs that designate owners and stop work, so "where did this come from" is
+      # the same question about both.
       - name: Checksum
         shell: bash
         run: |
-          asset="piplex-${{ steps.version.outputs.version }}.hpi"
-          sha256sum "${asset}" > "${asset}.sha256"
-          cat "${asset}.sha256"
+          version="${{ steps.version.outputs.version }}"
+          for asset in "piplex-${version}.hpi" "piplex-operator-${version}.zip"; do
+            sha256sum "${asset}" > "${asset}.sha256"
+            cat "${asset}.sha256"
+          done
 
       - name: Hand the assets to the publishing job
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: hpi
+          name: release-assets
           path: |
             piplex-${{ steps.version.outputs.version }}.hpi
             piplex-${{ steps.version.outputs.version }}.hpi.sha256
+            piplex-operator-${{ steps.version.outputs.version }}.zip
+            piplex-operator-${{ steps.version.outputs.version }}.zip.sha256
           if-no-files-found: error
           retention-days: 1
 
   publish:
-    name: Publish the .hpi
+    name: Publish release
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -109,22 +177,32 @@ jobs:
       - name: Take the assets from the build job
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: hpi
+          name: release-assets
 
-      - name: Check the checksum
+      - name: Check the checksums
         shell: bash
-        run: sha256sum -c "piplex-${{ needs.build.outputs.version }}.hpi.sha256"
+        run: |
+          version="${{ needs.build.outputs.version }}"
+          sha256sum -c "piplex-${version}.hpi.sha256"
+          sha256sum -c "piplex-operator-${version}.zip.sha256"
 
       # Says which workflow, at which commit, produced these bytes, signed by GitHub rather than by us.
       # `gh attestation verify piplex-<version>.hpi --repo green4j/piplex` checks it, and that is a
       # question worth being able to answer about a plugin that runs on a controller.
+      #
+      # Both subjects, and the archive is not the lesser one: its files are copied into jobs that
+      # designate owners and stop work everywhere. A signed plugin beside an unsigned pipeline that
+      # can halt the nightly run would be attesting the wrong half.
       - name: Attest the build
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: piplex-${{ needs.build.outputs.version }}.hpi
+          subject-path: |
+            piplex-${{ needs.build.outputs.version }}.hpi
+            piplex-operator-${{ needs.build.outputs.version }}.zip
 
-      # One file, and it carries everything: the core, the discas adapter and the discas client are
-      # inside it. An operator downloads it and deploys it to every controller.
+      # Two payloads. The .hpi carries everything a controller runs: the core, the discas adapter and
+      # the discas client are inside it. The archive carries what an operator copies into jobs, plus
+      # the procedure for standing it all up.
       #
       # A re-run of a tag whose assets are already published stops here rather than replacing them: the
       # bytes an operator has checksummed are not something to overwrite silently. Uploading what is
@@ -135,10 +213,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          asset="piplex-${{ needs.build.outputs.version }}.hpi"
+          version="${{ needs.build.outputs.version }}"
+          assets=(
+            "piplex-${version}.hpi" "piplex-${version}.hpi.sha256"
+            "piplex-operator-${version}.zip" "piplex-operator-${version}.zip.sha256"
+          )
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" "${asset}" "${asset}.sha256"
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}"
           else
-            gh release create "${GITHUB_REF_NAME}" "${asset}" "${asset}.sha256" \
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
               --title "${GITHUB_REF_NAME}" --generate-notes
           fi

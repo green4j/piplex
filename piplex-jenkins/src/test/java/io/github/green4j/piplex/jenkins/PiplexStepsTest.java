@@ -9,6 +9,7 @@ package io.github.green4j.piplex.jenkins;
 
 import hudson.AbortException;
 import hudson.ExtensionList;
+import hudson.model.Computer;
 import hudson.model.Result;
 import hudson.model.TaskListener;
 import io.github.green4j.piplex.Environment;
@@ -34,6 +35,7 @@ import org.jenkinsci.plugins.workflow.steps.StepContext;
 import org.jenkinsci.plugins.workflow.steps.StepDescriptor;
 import org.jenkinsci.plugins.workflow.steps.StepExecution;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -41,6 +43,7 @@ import org.kohsuke.stapler.DataBoundConstructor;
 
 import java.lang.reflect.Proxy;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -73,9 +76,24 @@ class PiplexStepsTest {
     private final TimeSource time = TimeSource.of(scheduler);
     private InMemoryCoordinationStore store;
 
+    /** See {@link Delays}. */
+    private final Delays impatient = new Delays();
+
     @BeforeEach
     void setUp() {
         store = new InMemoryCoordinationStore(time);
+    }
+
+    /**
+     * Puts the real store back.
+     *
+     * <p>{@code useStore} sets a static, and nothing else clears it. Left set, it is inherited by
+     * whichever class JUnit runs next, which then asks a store this one made about keys it never
+     * wrote -- a failure that moves when a test class is renamed.
+     */
+    @AfterEach
+    void releaseTheSuppliedStore() {
+        PiplexConfiguration.useStore(null, null);
     }
 
     @Test
@@ -234,6 +252,63 @@ class PiplexStepsTest {
         assertTrue(leaseIsFree(), "Once the body has ended, the lease goes back");
     }
 
+    @Test
+    void doesNotCallTheControllerDrainedUntilTheStoppedBodyHasEnded(final JenkinsRule jenkins)
+            throws Exception {
+        configure("euc1-blue");
+        designate("euc1-blue");
+        ExtensionList.lookup(StepDescriptor.class).add(new SlowToStop.DescriptorImpl());
+        SlowToStop.reset();
+
+        final WorkflowJob work = jenkins.createProject(WorkflowJob.class, "eod-drain-waits");
+        work.setDefinition(new CpsFlowDefinition("""
+                piplexExclusive(key: 'eod', designatedBy: 'eod', enabledBy: 'eod-switch',
+                                generation: '2026-09-12') {
+                    slowToStop()
+                }
+                """, true));
+        final WorkflowRun running = work.scheduleBuild2(0).waitForStart();
+        jenkins.waitForMessage("working", running);
+
+        // Disabling the switch revokes the admission at once, and revoking only asks Jenkins to stop
+        // the body. Answered on whether the admission was still held, this drain would report the
+        // controller quiet here -- with the work still running, which is the whole point of the wait.
+        final WorkflowJob drain = jenkins.createProject(WorkflowJob.class, "eod-drain-waits-op");
+        drain.setDefinition(new CpsFlowDefinition("""
+                withPiplexOperator {
+                    piplexSwitch key: 'eod-switch', enabled: false, ownerId: 'euc1-blue',
+                                 reason: 'patching', drainTimeout: '5s'
+                }
+                """, true));
+        final WorkflowRun refused = drain.scheduleBuild2(0).get();
+
+        // The step's own timeout is what ends the wait, so nothing here waits for a guessed interval:
+        // the body is still held, and a drain that finished at all could only have finished by
+        // reporting it quiet.
+        jenkins.assertBuildStatus(Result.FAILURE, refused);
+        jenkins.assertLogContains("piplex: DRAINING key=eod-switch", refused);
+        jenkins.assertLogContains("work it guards is still running on this controller", refused);
+        jenkins.assertLogNotContains("piplex: DRAINED", refused);
+        assertTrue(running.isBuilding(), "And it was still running the whole time");
+
+        SlowToStop.letGo.complete(null);
+        jenkins.waitForCompletion(running);
+        jenkins.assertBuildStatus(Result.ABORTED, running);
+
+        // The other half: once the body has actually ended, the same drain is answered.
+        final WorkflowJob again = jenkins.createProject(WorkflowJob.class, "eod-drain-waits-op-2");
+        again.setDefinition(new CpsFlowDefinition("""
+                withPiplexOperator {
+                    piplexSwitch key: 'eod-switch', enabled: false, ownerId: 'euc1-blue',
+                                 reason: 'patching', drainTimeout: '30s'
+                }
+                """, true));
+        final WorkflowRun drained = again.scheduleBuild2(0).get();
+
+        jenkins.assertBuildStatus(Result.SUCCESS, drained);
+        jenkins.assertLogContains("piplex: DRAINED key=eod-switch", drained);
+    }
+
     /**
      * A step which, told to stop, ends only when the test lets it.
      */
@@ -358,6 +433,35 @@ class PiplexStepsTest {
     }
 
     @Test
+    void diagnosesTheActiveKeyTheWayTheWorkReadsIt(final JenkinsRule jenkins) throws Exception {
+        configure("euc1-blue");
+        // The other site is active, so this controller may not run.
+        activate("euc1-green");
+
+        // A request naming activeWhenKey and no value waits for this controller's own name. Copied
+        // into piplexInspect -- which is what its documentation tells an operator to do -- a value
+        // read as "no guard at all" makes the diagnosis say the work can run while the work is being
+        // refused, and sends somebody to the schedule and the build logs for an answer that is here.
+        final WorkflowRun refused = build(jenkins, "eod-active-elsewhere", """
+                piplexExclusive(key: 'eod', activeWhenKey: '/dc/active') {
+                    echo 'this must not run'
+                }
+                """);
+
+        jenkins.assertBuildStatus(Result.NOT_BUILT, refused);
+        jenkins.assertLogNotContains("this must not run", refused);
+
+        final WorkflowRun diagnosis = build(jenkins, "eod-active-elsewhere-why", """
+                piplexInspect key: 'eod', activeWhenKey: '/dc/active'
+                """);
+
+        jenkins.assertBuildStatus(Result.SUCCESS, diagnosis);
+        jenkins.assertLogContains("'/dc/active' is 'euc1-green', and this work runs at 'euc1-blue'",
+                diagnosis);
+        jenkins.assertLogNotContains("nothing in these keys is stopping this work", diagnosis);
+    }
+
+    @Test
     void doesNotRunTheBodyWhenOwnershipIsGoneBeforeItCouldStart(final JenkinsRule jenkins)
             throws Exception {
         designate("euc1-blue");
@@ -462,6 +566,10 @@ class PiplexStepsTest {
 
         jenkins.assertBuildStatus(Result.FAILURE, run);
         jenkins.assertLogContains("PiplexOwnership", run);
+        // And it says which block to put this in. Jenkins can only name a step that declares it
+        // provides the missing context, so without that declaration the refusal is correct and
+        // useless: a class name, to somebody who has never heard of the class.
+        jenkins.assertLogContains("piplexExclusive", run);
     }
 
     @Test
@@ -587,9 +695,9 @@ class PiplexStepsTest {
         configure("eus1-blue");
         designate("euc1-blue");
 
-        // The shape the euroctp templates would use, and the reason the step takes a block at all: in
-        // options{} the block is the whole build, so a controller that is not the one to run never
-        // reaches a stage -- and never allocates the agent one would have needed.
+        // The reason the step takes a block at all: in options{} the block is the whole build, so a
+        // controller that is not the one to run never reaches a stage -- and never allocates the
+        // agent one would have needed.
         final WorkflowRun run = build(jenkins, "eod-declarative", """
                 pipeline {
                     agent none
@@ -603,6 +711,48 @@ class PiplexStepsTest {
                 """);
 
         jenkins.assertBuildStatus(Result.NOT_BUILT, run);
+        jenkins.assertLogNotContains("this must not run", run);
+    }
+
+    // A pipeline that declares a real agent at the top -- a container, say -- rather than the agent
+    // none above. Parking is only cheap if the options{} wrapper runs outside that allocation: a
+    // standby holding a pod for a four-hour handoverWait is not a wait anybody would accept. Measured
+    // rather than reasoned about, and the flyweight every Pipeline build holds is subtracted, since
+    // counting it would make any answer look the same.
+    @Test
+    void parksWithoutAllocatingTheAgentItDeclares(final JenkinsRule jenkins) throws Exception {
+        configure("eus1-blue");
+        designate("euc1-blue");
+
+        final WorkflowJob job = jenkins.createProject(WorkflowJob.class, "eod-parks-agentless");
+        job.setDefinition(new CpsFlowDefinition("""
+                pipeline {
+                    agent any
+                    options {
+                        piplexExclusive(key: 'eod', designatedBy: 'eod', generation: '2026-09-12',
+                                        handoverWait: '60s')
+                    }
+                    stages {
+                        stage('EOD') { steps { echo 'this must not run' } }
+                    }
+                }
+                """, true));
+        final WorkflowRun run = job.scheduleBuild2(0).waitForStart();
+        jenkins.waitForMessage("PARKED", run);
+
+        int busy = 0;
+        int flyweight = 0;
+        for (final Computer computer : jenkins.jenkins.getComputers()) {
+            busy += computer.countBusy();
+            flyweight += computer.getOneOffExecutors().size();
+        }
+        assertEquals(0, busy - flyweight,
+                "A parked candidate must hold no executor beyond the flyweight every build has");
+        assertEquals(0, jenkins.jenkins.getQueue().getItems().length,
+                "A parked candidate must not be queued for an agent either");
+
+        run.doStop();
+        jenkins.waitForCompletion(run);
         jenkins.assertLogNotContains("this must not run", run);
     }
 
@@ -680,6 +830,63 @@ class PiplexStepsTest {
     }
 
     @Test
+    void endsAStopWhenTheMilestoneNeverLands(final JenkinsRule jenkins) throws Exception {
+        PiplexConfiguration.get().setOwnerId("euc1-blue");
+        final String milestone = Milestones.keyOf(Environment.DEFAULT, "data/euc1");
+        final CompletableFuture<Void> publishAsked = new CompletableFuture<>();
+        PiplexConfiguration.useStore((CoordinationStore) Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[] {CoordinationStore.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("compareAndSet") && milestone.equals(args[0])) {
+                        publishAsked.complete(null);
+                        // Never settles: the node it went to has stopped answering.
+                        return new CompletableFuture<Boolean>();
+                    }
+                    return method.invoke(store, args);
+                }), impatient);
+
+        final WorkflowJob job = jenkins.createProject(WorkflowJob.class, "eod-publish-never-lands");
+        job.setDefinition(new CpsFlowDefinition("""
+                node {
+                    piplexPublish key: 'data/euc1', generation: '2026-09-12'
+                }
+                """, true));
+        final WorkflowRun run = job.scheduleBuild2(0).waitForStart();
+        publishAsked.get(30L, TimeUnit.SECONDS);
+
+        // Waiting for the write is right; waiting for it with no bound leaves the step for Jenkins to
+        // kill five minutes later, which is five minutes of an executor and an answer nobody gives.
+        run.doStop();
+        final long from = System.nanoTime();
+        jenkins.waitForCompletion(run);
+        jenkins.assertBuildStatus(Result.ABORTED, run);
+        assertTrue(Duration.ofNanos(System.nanoTime() - from).toSeconds() < 60L,
+                "The step must answer the stop rather than wait to be killed");
+    }
+
+    @Test
+    void overwritesAMilestoneNothingCanParseOnlyWhenAskedTo(final JenkinsRule jenkins) throws Exception {
+        configure("euc1-blue");
+        store.compareAndSet(Milestones.keyOf(Environment.DEFAULT, "data/euc1"),
+                        CoordinationStore.INITIAL_VERSION, "{\"generation\"")
+                .toCompletableFuture().get(10L, TimeUnit.SECONDS);
+
+        jenkins.assertBuildStatus(Result.FAILURE, build(jenkins, "eod-unreadable", """
+                node {
+                    piplexPublish key: 'data/euc1', generation: '2026-09-12'
+                }
+                """));
+
+        jenkins.assertBuildStatus(Result.SUCCESS, build(jenkins, "eod-repaired", """
+                node {
+                    piplexPublish key: 'data/euc1', generation: '2026-09-12', overwriteUnreadable: true
+                }
+                """));
+        assertEquals("2026-09-12", new Milestones(store, time).current("data/euc1")
+                .toCompletableFuture().get(10L, TimeUnit.SECONDS).generation().value());
+    }
+
+    @Test
     void waitsForAMilestoneAndThenCarriesOn(final JenkinsRule jenkins) throws Exception {
         configure("eus1-blue");
 
@@ -748,6 +955,23 @@ class PiplexStepsTest {
 
         jenkins.assertBuildStatus(Result.FAILURE, run);
         jenkins.assertLogContains("waited for 'data/euc1' to reach 2026-09-12", run);
+    }
+
+    @Test
+    void endsNotBuiltWhenAMilestoneNeverArrivesAndTheJobSaysToSkip(final JenkinsRule jenkins)
+            throws Exception {
+        configure("eus1-blue");
+
+        final WorkflowRun run = build(jenkins, "new-day-skipped", """
+                node {
+                    piplexAwait key: 'data/euc1', generation: '2026-09-12', timeout: '2s',
+                                skipOnTimeout: true
+                    echo 'the day is here'
+                }
+                """);
+
+        jenkins.assertBuildStatus(Result.NOT_BUILT, run);
+        jenkins.assertLogNotContains("the day is here", run);
     }
 
     @Test
@@ -859,6 +1083,30 @@ class PiplexStepsTest {
         final WorkflowJob job = jenkins.createProject(WorkflowJob.class, name);
         job.setDefinition(new CpsFlowDefinition(script, true));
         return job.scheduleBuild2(0).get();
+    }
+
+    /**
+     * The real clock, with the stop bound of {@code piplexPublish} brought within a test's patience.
+     * Nothing else scheduled here asks for a minute.
+     */
+    private final class Delays implements TimeSource {
+
+        private static final Duration STOP_BOUND = Duration.ofSeconds(60);
+
+        @Override
+        public long nanos() {
+            return time.nanos();
+        }
+
+        @Override
+        public Instant wallTime() {
+            return time.wallTime();
+        }
+
+        @Override
+        public Cancellable schedule(final Duration delay, final Runnable action) {
+            return time.schedule(STOP_BOUND.equals(delay) ? Duration.ofMillis(100) : delay, action);
+        }
     }
 
     /**

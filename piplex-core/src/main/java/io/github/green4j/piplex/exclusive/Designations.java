@@ -101,6 +101,22 @@ public final class Designations {
     }
 
     /**
+     * The other half of the same check: a designation naming nobody is held at the key like any other,
+     * and every candidate reads it and stands down. One blank string stops the work everywhere and
+     * looks, in the record, exactly like a deliberate handover.
+     *
+     * @param owner who may run the work
+     * @return it, once it names somebody
+     * @throws IllegalArgumentException if the owner is null or blank
+     */
+    private static String checkedOwner(final String owner) {
+        if (owner == null || owner.isBlank()) {
+            throw new IllegalArgumentException("owner must not be blank");
+        }
+        return owner;
+    }
+
+    /**
      * Reads who is designated.
      *
      * @param key what is being competed for
@@ -126,8 +142,7 @@ public final class Designations {
     public CompletionStage<DesignationChange> designate(final String key,
                                                         final String owner,
                                                         final String reason) {
-        Objects.requireNonNull(owner, "owner");
-        return designate(key, owner, reason, false);
+        return designate(key, checkedOwner(owner), reason, false);
     }
 
     /**
@@ -142,8 +157,7 @@ public final class Designations {
      * @return what it was and what it is now
      */
     public CompletionStage<DesignationChange> repair(final String key, final String owner, final String reason) {
-        Objects.requireNonNull(owner, "owner");
-        return designate(key, owner, reason, true);
+        return designate(key, checkedOwner(owner), reason, true);
     }
 
     private CompletionStage<DesignationChange> designate(final String key,

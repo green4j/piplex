@@ -10,6 +10,7 @@ package io.github.green4j.piplex.jenkins;
 import hudson.AbortException;
 import hudson.model.Run;
 import hudson.model.TaskListener;
+import io.github.green4j.piplex.Environment;
 import io.github.green4j.piplex.Generation;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.exclusive.Admission;
@@ -114,6 +115,11 @@ final class ExclusiveStepExecution extends StepExecution {
     private int stateVersion = STATE_VERSION;
 
     private transient volatile Admitted admitted;
+    // The environment this step is actually working in, resolved once, before it joins IN_FLIGHT.
+    // Resolved rather than re-read: a step which named none took the controller's default as it
+    // stood when it asked, and a default changed under it afterwards must not move the step out of
+    // the environment whose drain is waiting for it.
+    private transient volatile Environment admittedIn;
     // The attempt still in flight, kept only so that a step which is over can call it off: a park is a
     // loop of rounds against three keys, and nothing else would stop it before handoverWait is out.
     private transient volatile CompletableFuture<Admission> asking;
@@ -251,6 +257,13 @@ final class ExclusiveStepExecution extends StepExecution {
         synchronized (this) {
             phase = ASKING;
         }
+        // A body here is one Jenkins is replaying, so the work is under way. Enrolled before the three
+        // refusals below, because each cancels that body asynchronously and it runs on until it
+        // notices -- and a drain asked meanwhile must not be told this controller is quiet. No
+        // environment yet: anyRunningUnder counts a member without one as running.
+        if (body != null) {
+            IN_FLIGHT.add(this);
+        }
         final AbortException unknown = unknownState(stateVersion, key);
         if (unknown != null) {
             // Through refuse, for the reason given below: the body may be replaying.
@@ -313,6 +326,7 @@ final class ExclusiveStepExecution extends StepExecution {
     }
 
     private void ask() throws Exception {
+        final boolean resuming = body != null;
         final TaskListener listener = getContext().get(TaskListener.class);
         // Both from one reading of the settings, or a Save landing between two asks would give this
         // request the old owner id and a store built from the new form.
@@ -324,14 +338,15 @@ final class ExclusiveStepExecution extends StepExecution {
             listener.getLogger().println("piplex: WARNING another live controller uses the owner id '"
                     + duplicated + "'; designations naming it name both controllers");
         }
-        // A body that is already there is one Jenkins is resuming after a restart. Everything about this
-        // attempt is different because of it: the work is under way, so there is nothing to wait for and
-        // nothing to start.
-        final boolean resuming = body != null;
+        // Everything about a resuming attempt is different: the work is under way, so there is nothing
+        // to wait for and nothing to start.
         final ExclusiveRequest request = request(configured.ownerId(), resuming);
         if (!resuming && !request.handoverWait().isZero()) {
             countWaiting(configured.time(), request.renewEvery());
         }
+        // Before the set, so a step joining here joins with one. A resuming step is already in it,
+        // counted under every environment until this narrows it to its own.
+        admittedIn = configured.piplex().environment();
         IN_FLIGHT.add(this);
         final CompletableFuture<Admission> asked =
                 configured.piplex().runs().begin(request).toCompletableFuture();
@@ -382,7 +397,7 @@ final class ExclusiveStepExecution extends StepExecution {
                 // park: it would be doing the work for as long as it waited for permission to do it.
                 .handoverWait(resuming
                         ? Duration.ZERO
-                        : notWaitedYet(Durations.parse(handoverWait, Duration.ZERO, "handoverWait")));
+                        : notWaitedYet(Durations.orZero(handoverWait, "handoverWait")));
         if (activeWhenKey != null && !activeWhenKey.isBlank()) {
             // One Jenkinsfile for every site: each controller waits for its own name by default.
             builder.activeWhen(activeWhenKey.trim(), activeWhenValue == null || activeWhenValue.isBlank()
@@ -579,6 +594,50 @@ final class ExclusiveStepExecution extends StepExecution {
     }
 
     /**
+     * Whether work the named switch governs has still to stop on this controller.
+     *
+     * <p>What taking a controller out for maintenance actually needs to know, and a local question
+     * rather than a stored one: the work is done by a process, and no key says which processes are
+     * still doing it. It is asked of the controller being drained, which is the only one that can
+     * answer it.
+     *
+     * <p>Membership of {@link #IN_FLIGHT} is the whole answer, and deliberately so. Whether the
+     * ownership is still <em>held</em> is a different question with a different answer: disabling the
+     * switch revokes the admission at once, but revoking only asks Jenkins to cancel the body, and a
+     * body goes on running until it notices. A step leaves that set in {@link #release()}, reached
+     * from {@link #bodyFinished} -- the one place where what the body did is known -- so the set says
+     * "has not stopped" for exactly as long as that is true. It also covers the two moments an
+     * admission is absent while the work is not: an attempt still being made, and a step re-asking
+     * after a restart while Jenkins replays a body that never stopped.
+     *
+     * <p>Matched on {@code enabledBy} rather than on the exclusive key, because that is what a switch
+     * governs: one switch may guard several keys, and the same key may be guarded by none.
+     *
+     * @param enabledBy   the switch, as a request names it
+     * @param environment the environment it was named in
+     * @return whether anything this switch stops has still to stop here
+     */
+    static boolean anyRunningUnder(final String enabledBy, final Environment environment) {
+        final String switched = enabledBy.trim();
+        for (final ExclusiveStepExecution execution : IN_FLIGHT) {
+            final String governs = execution.enabledBy;
+            if (governs == null || !switched.equals(governs.trim())) {
+                continue;
+            }
+            // Compared as resolved, not as written: one step naming "prod" and another leaving it to a
+            // controller whose default is prod are in the same environment, and a drain that missed
+            // one of them would report a controller quiet while it was still working. A member with
+            // none yet is counted in -- it is running work whose environment cannot be told apart, and
+            // the alternative is reporting the controller quiet.
+            final Environment working = execution.admittedIn;
+            if (working == null || environment.equals(working)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * @param phase where the step is
      * @return why ownership was lost, or {@code null} when it was not
      */
@@ -632,11 +691,15 @@ final class ExclusiveStepExecution extends StepExecution {
      */
     private void refuse(final Throwable cause) {
         final BodyExecution running;
+        final boolean over;
         synchronized (this) {
             if (phase == ABANDONED) {
                 return;
             }
-            running = body;
+            // A body that has already ended hears no cancel: its callback ran before the controller
+            // went down. What is owed is the answer that callback never gave, written down for this.
+            over = bodyEnded;
+            running = over ? null : body;
             if (running != null) {
                 // The body may still end well before the cancel below lands.
                 lost(cause);
@@ -646,10 +709,16 @@ final class ExclusiveStepExecution extends StepExecution {
                 if (phase == ANSWERED || phase == ENDED) {
                     return;
                 }
-                // Remembered for an attempt still in flight: the context is answered below, so what
-                // that attempt comes back with must be given back rather than started.
-                phase = ANSWERED;
+                if (!over) {
+                    // Remembered for an attempt still in flight: the context is answered below, so
+                    // what that attempt comes back with must be given back rather than started.
+                    phase = ANSWERED;
+                }
             }
+        }
+        if (over) {
+            answerForTheEndedBody();
+            return;
         }
         if (running != null) {
             // Cancelling is what ends the step here: the body's callback releases the ownership and
