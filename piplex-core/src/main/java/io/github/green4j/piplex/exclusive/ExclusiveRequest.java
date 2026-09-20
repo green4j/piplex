@@ -92,6 +92,15 @@ public record ExclusiveRequest(String key,
         if (key.isBlank()) {
             throw new IllegalArgumentException("key must not be blank");
         }
+        // The same reasoning, for every other name this turns into a key. The key builders refuse them
+        // too, but mid-admission, naming neither the request nor the field. A blank ownerId is not
+        // caught even there: it composes the identity "/<runId>" and the drain key "<enabledBy>/@".
+        blankRefused(ownerId, "ownerId");
+        blankRefused(runId, "runId");
+        blankRefused(executionId, "executionId");
+        blankRefused(designatedBy, "designatedBy");
+        blankRefused(enabledBy, "enabledBy");
+        blankRefused(completedWhen, "completedWhen");
         if (lease.isNegative() || lease.isZero()) {
             throw new IllegalArgumentException("lease must be positive");
         }
@@ -138,6 +147,18 @@ public record ExclusiveRequest(String key,
         }
         if (completedWhen != null && generation == null) {
             throw new IllegalArgumentException("completedWhen needs a generation to compare against");
+        }
+    }
+
+    /**
+     * @param named what was given, or {@code null} where the field is optional
+     * @param what  the field, for the sentence a refusal reads as
+     * @throws IllegalArgumentException if it is there and says nothing
+     */
+    private static void blankRefused(final String named, final String what) {
+        // Null is an optional field left unset; blank is one set to nothing, which is a mistake.
+        if (named != null && named.isBlank()) {
+            throw new IllegalArgumentException(what + " must not be blank");
         }
     }
 

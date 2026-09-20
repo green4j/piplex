@@ -108,7 +108,8 @@ the model, API guides, Jenkins reference, operations, security and recovery proc
 |---|---|
 | `piplex-core` | Store-independent model and primitives |
 | `piplex-discas` | `CoordinationStore` backed by [discas](https://github.com/green4j/discas) |
-| `piplex-jenkins` | Jenkins plugin and four Pipeline steps |
+| `piplex-jenkins` | Jenkins plugin, its work steps and its operator steps |
+| `piplex-init` | Prepares a deployment: the ACL, the controller configurations, the operator jobs and the pipeline block, from one description |
 | `piplex-example` | Runnable examples |
 
 Implementations are constructed explicitly:
@@ -121,20 +122,22 @@ Piplex piplex = new Piplex(store, TimeSource.of(scheduler), observer);
 Piplex uat = piplex.in(Environment.of("uat"));
 ```
 
-The modules are not published to Maven. A release contains one `.hpi` with the required modules and
-client libraries.
+The modules are not published to Maven. A release contains one `.hpi` with the required runtime
+modules and client libraries, plus an operator archive with the `piplex-init` executable jar,
+POSIX and Windows launchers, the job templates and the deployment procedure.
 
 ### Build
 
-Java 21 is required:
+Java 21 and a running Docker daemon are required. `build` runs the integration tests, and those start
+a discas node:
 
 ```text
 ./gradlew build
 ./gradlew :piplex-jenkins:jpi
 ```
 
-The plugin baseline is Jenkins 2.555.1; CI also tests Jenkins 2.568.3. Its embedded discas client is
-pinned by `discasVersion`; client and cluster nodes must run the same discas version.
+The plugin baseline is the security-fixed Jenkins 2.568.3. Its embedded discas client is pinned by
+`discasVersion`; client and cluster nodes must run the same discas version.
 
 ### License
 

@@ -131,8 +131,17 @@ public final class ExclusiveRuns {
         return key;
     }
 
-    static String leaseKey(final Environment environment, final String key) {
+    /**
+     * @param environment which set of orchestrations the work belongs to
+     * @param key         the work, as a request names it
+     * @return the store key its lease is taken at
+     */
+    public static String keyOf(final Environment environment, final String key) {
         return environment.prefixOf(KIND) + key;
+    }
+
+    static String leaseKey(final Environment environment, final String key) {
+        return keyOf(environment, key);
     }
 
     // The same keys, in this instance's environment. The store keys of one run all come from here.

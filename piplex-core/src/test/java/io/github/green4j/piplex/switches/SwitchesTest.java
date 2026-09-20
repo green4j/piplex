@@ -85,6 +85,11 @@ class SwitchesTest {
         assertEquals("piplex/default/enabled/eod/@blue",
                 Switches.keyOf(Environment.DEFAULT, Switches.ownerKey(KEY, "blue")));
         assertTrue(Switches.namesAnOwner(Switches.ownerKey(KEY, "team/blue")));
+
+        // "<key>/@" reads as a real drain key and drains nobody, so neither half may be missing.
+        assertThrows(IllegalArgumentException.class, () -> Switches.ownerKey(KEY, " "));
+        assertThrows(IllegalArgumentException.class, () -> Switches.ownerKey(KEY, null));
+        assertThrows(IllegalArgumentException.class, () -> Switches.ownerKey(" ", "blue"));
         assertFalse(Switches.namesAnOwner("eod/blue"));
     }
 

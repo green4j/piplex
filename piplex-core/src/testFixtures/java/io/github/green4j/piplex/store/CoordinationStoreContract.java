@@ -135,8 +135,6 @@ public abstract class CoordinationStoreContract {
         assertTrue(bound.compareTo(Duration.ZERO) > 0, "A stage must be bounded by some positive time");
     }
 
-    // ---- values ---------------------------------------------------------------------------------
-
     @Test
     void readsAnAbsentKeyAsAbsentWithAVersion() {
         final Entry entry = done(store().get(key("absent")));
@@ -164,8 +162,6 @@ public abstract class CoordinationStoreContract {
         assertEquals("second", now.value());
         assertNotEquals(seen.version(), now.version(), "A write that changed the value must move the version");
     }
-
-    // ---- waiting --------------------------------------------------------------------------------
 
     @Test
     void answersAtOnceWhenTheKeyHasAlreadyMoved() {
@@ -212,8 +208,6 @@ public abstract class CoordinationStoreContract {
         assertNotEquals(seen.version(), entry.version());
         assertTrue(Set.of("two", "three").contains(entry.value()), "Saw " + entry.value());
     }
-
-    // ---- leases ---------------------------------------------------------------------------------
 
     @Test
     void grantsALeaseToOneOwnerAtATime() {
@@ -313,8 +307,6 @@ public abstract class CoordinationStoreContract {
         done(store().release(key, first.handle()));
     }
 
-    // ---- values and leases do not mix -----------------------------------------------------------
-
     @Test
     void refusesALeaseOnAKeyHoldingAValue() {
         final String key = key("value-then-lease");
@@ -347,8 +339,6 @@ public abstract class CoordinationStoreContract {
                 done(store().tryAcquire(key, "owner-b/run-1", Duration.ofMinutes(1))));
     }
 
-    // ---- closing --------------------------------------------------------------------------------
-
     @Test
     void refusesEverythingOnceClosed() {
         final CoordinationStore closed = FailFastStore.of(newStore(), TIME);
@@ -378,8 +368,6 @@ public abstract class CoordinationStoreContract {
         assertThrows(CompletionException.class, () -> done(waiting),
                 "A wait outstanding when the store closes has to be told");
     }
-
-    // ---- helpers --------------------------------------------------------------------------------
 
     /**
      * @param stage what a store answered

@@ -87,8 +87,6 @@ class EnvironmentTest {
         assertNotEquals(prod.environment(), uat.environment());
     }
 
-    // ---- what the segment is for ----------------------------------------------------------------
-
     @Test
     void admitsTheSameWorkInTwoEnvironmentsAtOnce() {
         // The requirement itself. One cluster serving production and uat must run the nightly job in

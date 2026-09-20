@@ -4,5 +4,6 @@ include(
         'piplex-core',
         'piplex-discas',
         'piplex-jenkins',
+        'piplex-init',
         'piplex-example'
 )

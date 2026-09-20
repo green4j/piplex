@@ -11,6 +11,8 @@ import hudson.Extension;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import io.github.green4j.piplex.Generation;
+import io.github.green4j.piplex.TimeSource;
+import io.github.green4j.piplex.milestone.Milestones;
 import io.github.green4j.piplex.milestone.PublishResult;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.workflow.steps.Step;
@@ -20,6 +22,7 @@ import org.jenkinsci.plugins.workflow.steps.StepExecution;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 
+import java.time.Duration;
 import java.util.Set;
 
 /**
@@ -34,6 +37,7 @@ public final class PiplexPublishStep extends Step {
     private final String key;
     private final String generation;
     private String environment;
+    private boolean overwriteUnreadable;
 
     /**
      * @param key        the milestone
@@ -66,9 +70,26 @@ public final class PiplexPublishStep extends Step {
         return environment;
     }
 
+    /**
+     * @param value whether to overwrite a record that does not parse. It changes nothing else: against
+     *              a readable record this publishes exactly as it otherwise would, monotonicity
+     *              included, so a milestone at or ahead of this generation is still kept. Set it only
+     *              once a key has been reported unreadable, because a stored value nothing can parse
+     *              blocks every ordinary write to that key for good. Having replaced one, the record
+     *              names no run: what the old one said is unknown
+     */
+    @DataBoundSetter
+    public void setOverwriteUnreadable(final boolean value) {
+        this.overwriteUnreadable = value;
+    }
+
+    public boolean isOverwriteUnreadable() {
+        return overwriteUnreadable;
+    }
+
     @Override
     public StepExecution start(final StepContext context) {
-        return new Execution(context, key, generation, environment);
+        return new Execution(context, key, generation, environment, overwriteUnreadable);
     }
 
     /**
@@ -97,26 +118,35 @@ public final class PiplexPublishStep extends Step {
     private static final class Execution extends StepExecution {
 
         private static final long serialVersionUID = 1L;
+        // Long enough that a store merely slow still lands the write -- the lease must not go back
+        // before the milestone -- and well short of the five minutes after which Jenkins kills a build
+        // whose steps did not stop.
+        private static final Duration STOP_TIMEOUT = Duration.ofSeconds(60);
 
         private final String key;
         private final String generation;
         // Written down with the rest: a resumed publish must write in the environment it began in.
         private final String environment;
+        private final boolean overwriteUnreadable;
 
         // Not carried across a restart: onResume publishes again, and that write is nobody's to stop yet.
         private transient boolean answered;
-        // A write sent and not yet settled, and the stop that arrived meanwhile. Guarded by this.
+        // A write sent and not yet settled, the clock that bounds a stop arriving meanwhile, and that
+        // stop. Guarded by this.
         private transient boolean writing;
+        private transient TimeSource time;
         private transient Throwable stoppedWith;
 
         Execution(final StepContext context,
                   final String key,
                   final String generation,
-                  final String environment) {
+                  final String environment,
+                  final boolean overwriteUnreadable) {
             super(context);
             this.key = key;
             this.generation = generation;
             this.environment = environment;
+            this.overwriteUnreadable = overwriteUnreadable;
         }
 
         @Override
@@ -137,11 +167,20 @@ public final class PiplexPublishStep extends Step {
                     // Answered once the write settles. Answered now, the body ends and its lease goes
                     // back while the milestone is still on its way, and the next owner redoes the work.
                     stoppedWith = cause;
+                    // But bounded: a store that has stopped answering must not hold the step until
+                    // Jenkins kills the build. Does nothing if the write settles first.
+                    time.schedule(STOP_TIMEOUT, () -> waitedLongEnough(cause));
                     return;
                 }
             }
             if (answering()) {
                 super.stop(cause);
+            }
+        }
+
+        private void waitedLongEnough(final Throwable cause) {
+            if (answering()) {
+                getContext().onFailure(cause);
             }
         }
 
@@ -185,14 +224,17 @@ public final class PiplexPublishStep extends Step {
                     PiplexConfiguration.require().configuredFor(listener, environment);
             synchronized (this) {
                 writing = true;
+                time = configured.time();
             }
             try {
-                configured.piplex().milestones()
+                final Milestones milestones = configured.piplex().milestones();
+                (overwriteUnreadable
+                        ? milestones.repair(key, Generation.of(generation))
                         // The externalizable id, "eod#142", which is what the exclusive step writes and
                         // what an aggregator groups a night's events by. A display name is a pipeline's to
                         // set, so two runs can carry the same one and the grouping quietly merges them.
-                        .publish(key, Generation.of(generation), configured.ownerId(),
-                                run.getExternalizableId())
+                        : milestones.publish(key, Generation.of(generation), configured.ownerId(),
+                                run.getExternalizableId()))
                         .whenComplete(this::written);
             } catch (final RuntimeException notSent) {
                 synchronized (this) {

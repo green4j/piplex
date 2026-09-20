@@ -76,8 +76,8 @@ independently. Neither extends ownership past the current lease term. See
 
 ### Parking and handover
 
-A candidate that is not designated or not active, or finds the lease occupied, may wait for `handoverWait`.
-Parking holds no thread or executor. Each bounded round watches:
+A candidate that is not designated or not active, or finds the lease occupied, may wait for
+`handoverWait`. Parking holds no thread or executor. Each bounded round watches:
 
 - `piplex/<environment>/designated/<designatedBy>`;
 - `piplex/<environment>/enabled/<enabledBy>`;
@@ -131,8 +131,8 @@ ExclusiveRequest.builder("eod")
 ```
 
 The value is compared exactly and an absent key never matches. The key is used as is and must not
-start with `piplex/`. Switches and `completedWhen` combine with it. Any string is readable, so this guard never reports `GuardUnreadable`; an
-unreachable key still ends the run after `guardGrace`.
+start with `piplex/`. Switches and `completedWhen` combine with it. Any string is readable, so this
+guard never reports `GuardUnreadable`; an unreachable key still ends the run after `guardGrace`.
 
 ### Completion ordering
 

@@ -7,6 +7,7 @@
 
 package io.github.green4j.piplex.jenkins;
 
+import hudson.ExtensionList;
 import hudson.model.Computer;
 import hudson.model.Executor;
 import hudson.model.Result;
@@ -25,7 +26,9 @@ import io.github.green4j.piplex.store.memory.InMemoryCoordinationStore;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
+import org.jenkinsci.plugins.workflow.steps.StepDescriptor;
 import org.jenkinsci.plugins.workflow.steps.StepExecution;
+import org.junit.After;
 import org.junit.Rule;
 import org.junit.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -86,6 +89,18 @@ public class PiplexRestartTest {
 
     @Rule
     public JenkinsSessionRule session = new JenkinsSessionRule();
+
+    /**
+     * Puts the real store back.
+     *
+     * <p>{@code useStore} sets a static, and nothing else clears it. Left set, it is inherited by
+     * whichever class runs next, which then asks a store this one made about keys it never wrote --
+     * a failure that moves when a test class is renamed.
+     */
+    @After
+    public void releaseTheSuppliedStore() {
+        PiplexConfiguration.useStore(null, null);
+    }
 
     @Test
     public void aParkedRunSurvivesARestartAndThenTakesOver() throws Throwable {
@@ -344,6 +359,54 @@ public class PiplexRestartTest {
         controllerCameBack();
 
         assertResumedAs("eod-unconfigured", Result.ABORTED, "owner id");
+    }
+
+    /**
+     * A resumed step whose ask is refused still counts as running here until its body has ended.
+     *
+     * <p>The refusal cancels the body, and cancelling is asynchronous: the guarded work runs on until
+     * it notices. Enrolled only after the ask succeeded, the step would be in nothing for the whole of
+     * that window and a drain would call this controller quiet with the work still going.
+     *
+     * @throws Throwable if the session fails
+     */
+    @Test
+    public void countsAResumedBodyAsRunningWhileAskingAgainIsRefused() throws Throwable {
+        session.then(jenkins -> {
+            configure("euc1-blue");
+            designate("eod-resumed", "euc1-blue");
+            ExtensionList.lookup(StepDescriptor.class).add(new PiplexStepsTest.SlowToStop.DescriptorImpl());
+            PiplexStepsTest.SlowToStop.reset();
+
+            final WorkflowJob job = jenkins.createProject(WorkflowJob.class, "eod-resumed");
+            job.setDefinition(new CpsFlowDefinition("""
+                    piplexExclusive(key: 'eod-resumed', designatedBy: 'eod-resumed',
+                                    enabledBy: 'eod-switch', generation: '2026-09-12', lease: '2s') {
+                        slowToStop()
+                    }
+                    """, true));
+            final WorkflowRun run = job.scheduleBuild2(0).waitForStart();
+            jenkins.waitForMessage("working", run);
+        });
+
+        controllerWentAway();
+        Files.delete(session.getHome().toPath()
+                .resolve(PiplexConfiguration.class.getName() + ".xml"));
+        controllerCameBack();
+
+        session.then(jenkins -> {
+            final WorkflowRun run = jenkins.jenkins
+                    .getItemByFullName("eod-resumed", WorkflowJob.class).getBuildByNumber(1);
+
+            PiplexStepsTest.SlowToStop.stopAsked.get(AWAIT_SECONDS, TimeUnit.SECONDS);
+            assertTrue("A body told to stop and still running is work this controller has to wait for",
+                    ExclusiveStepExecution.anyRunningUnder("eod-switch", Environment.DEFAULT));
+
+            PiplexStepsTest.SlowToStop.letGo.complete(null);
+            awaitCompletion(run);
+            awaitUntil(() -> "the ended body left the set",
+                    () -> !ExclusiveStepExecution.anyRunningUnder("eod-switch", Environment.DEFAULT));
+        });
     }
 
     /**

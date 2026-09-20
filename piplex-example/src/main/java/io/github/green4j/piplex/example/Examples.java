@@ -8,6 +8,8 @@
 package io.github.green4j.piplex.example;
 
 import io.github.green4j.piplex.Generation;
+import io.github.green4j.piplex.exclusive.Admission;
+import io.github.green4j.piplex.exclusive.Admitted;
 
 import java.time.LocalDate;
 import java.util.concurrent.CompletionStage;
@@ -45,6 +47,19 @@ final class Examples {
         } catch (final TimeoutException timedOut) {
             throw new IllegalStateException("Gave up after " + WAIT_SECONDS + "s", timedOut);
         }
+    }
+
+    /**
+     * @param admission what came back
+     * @return it, admitted
+     * @throws IllegalStateException if it is not -- an example that casts reports a ClassCastException,
+     *         which names neither the outcome nor why it was the wrong one
+     */
+    static Admitted admitted(final Admission admission) {
+        if (admission instanceof Admitted held) {
+            return held;
+        }
+        throw new IllegalStateException("Expected to be admitted, got " + admission);
     }
 
     /**

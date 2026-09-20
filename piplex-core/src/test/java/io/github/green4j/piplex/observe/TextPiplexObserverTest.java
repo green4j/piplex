@@ -62,6 +62,12 @@ class TextPiplexObserverTest {
         // literal null is a value it has to learn to ignore.
         assertEquals("REVOKED environment=default key=eod generation=2026-09-12 owner=euc1-blue run=eod#142 "
                 + "reason=LEASE_LOST", lines.get(0));
+
+        // An empty one is a field with nothing in it too, and it is what every shipped operator job
+        // sends when nobody typed a change reference. Written, it is a dangling "reason=".
+        observer.disabled(RUN, "");
+        assertEquals("DISABLED environment=default key=eod generation=2026-09-12 owner=euc1-blue "
+                + "run=eod#142", lines.get(1));
     }
 
     @Test

@@ -8,6 +8,7 @@
 package io.github.green4j.piplex.jenkins;
 
 import io.github.green4j.piplex.Environment;
+import io.github.green4j.piplex.Instances;
 import io.github.green4j.piplex.TimeSource;
 import io.github.green4j.piplex.store.CoordinationStore;
 import io.github.green4j.piplex.store.FailFastStore;
@@ -39,8 +40,6 @@ final class OwnerHeartbeat {
     /** How long beats may keep failing to write before the check itself is reported as not working. */
     static final Duration SILENT_AFTER = Duration.ofMinutes(5);
 
-    private static final String KIND = "instances";
-
     private final String mark = UUID.randomUUID().toString();
     private final TimeSource time;
 
@@ -63,7 +62,7 @@ final class OwnerHeartbeat {
     }
 
     static String keyOf(final Environment environment, final String ownerId) {
-        return environment.prefixOf(KIND) + ownerId;
+        return Instances.keyOf(environment, ownerId);
     }
 
     /**

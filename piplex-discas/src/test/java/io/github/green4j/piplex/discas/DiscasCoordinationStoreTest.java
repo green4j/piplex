@@ -48,6 +48,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -415,12 +416,106 @@ class DiscasCoordinationStoreTest extends CoordinationStoreContract {
         assertEquals(owner, handle.ownerId(), "Round " + round + ": the lease is in the wrong name");
     }
 
+    @Test
+    void givesBackALeaseGrantedAfterItWasClosed() throws Exception {
+        // The token that renews or releases a lease is kept only in the answer to the acquire. Closing
+        // the store fails the caller's future, and the acquire the cluster is already working on still
+        // lands: dropped, the lease would stand until its term lapsed with nothing able to end it.
+        final EventLoop loop = new EventLoop("piplex-test-closing");
+        final ClientId id = ClientId.of("piplex-test-closing");
+        final HeldBack held = new HeldBack(new InProcessClientTransport(loop, NODE_IDS, id));
+        final DisCasClient own = new DisCasClient(id, held, loop, true);
+        final CoordinationStore closing = new DiscasCoordinationStore(own, ReadConsistency.LINEARIZABLE, false);
+        final String key = leaseKey();
+        try {
+            final CompletableFuture<LeaseAttempt> taking =
+                    closing.tryAcquire(key, "euc1-blue", TTL).toCompletableFuture();
+            awaitUntil("the acquire reached the cluster", () -> held.sent.get() > 0);
+
+            closing.close();
+            assertThrows(ExecutionException.class, () -> taking.get(10L, TimeUnit.SECONDS),
+                    "A closed store answers nobody");
+
+            held.letGo();
+
+            // The lease is the assertion: somebody else can take the key, which is only true if the one
+            // granted to a caller that had gone was given back.
+            awaitUntil("the orphaned lease went back", () -> {
+                final LeaseAttempt next = done(newStore().tryAcquire(key, "euc1-green", TTL));
+                return next instanceof LeaseAttempt.Acquired;
+            });
+        } finally {
+            own.close();
+        }
+    }
+
     private static String valueKey() {
         return "piplex-test/value-" + KEYS.incrementAndGet();
     }
 
     private static String leaseKey() {
         return "piplex-test/lease-" + KEYS.incrementAndGet();
+    }
+
+    /**
+     * A transport which holds everything the cluster answers until it is let go of.
+     */
+    private static final class HeldBack implements ClientTransport {
+
+        private final ClientTransport delegate;
+        private final AtomicInteger sent = new AtomicInteger();
+        private final List<ClientMessage> waiting = new CopyOnWriteArrayList<>();
+        private volatile Consumer<ClientMessage> handler;
+        private volatile boolean holding = true;
+
+        private HeldBack(final ClientTransport delegate) {
+            this.delegate = delegate;
+        }
+
+        void letGo() {
+            holding = false;
+            final Consumer<ClientMessage> to = handler;
+            waiting.forEach(to);
+            waiting.clear();
+        }
+
+        @Override
+        public void send(final NodeId targetNodeId, final ClientMessage message) {
+            sent.incrementAndGet();
+            delegate.send(targetNodeId, message);
+        }
+
+        @Override
+        public void register(final Consumer<ClientMessage> given) {
+            handler = given;
+            delegate.register(message -> {
+                if (holding) {
+                    waiting.add(message);
+                    return;
+                }
+                given.accept(message);
+            });
+        }
+
+        @Override
+        public void registerConnectionLost(final Consumer<NodeId> handler) {
+            delegate.registerConnectionLost(handler);
+        }
+
+        @Override
+        public List<NodeId> peers() {
+            return delegate.peers();
+        }
+
+        @Override
+        public int clusterSize() {
+            return delegate.clusterSize();
+        }
+
+        @Override
+        public void bindClock(final ClusterClock clock) {
+            delegate.bindClock(clock);
+        }
     }
 
     /**

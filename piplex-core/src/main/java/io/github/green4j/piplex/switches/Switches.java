@@ -109,9 +109,24 @@ public final class Switches {
      * @param key     the switch the work consults
      * @param ownerId the deployment
      * @return {@code <key>/@<ownerId>}, to pass wherever a switch is named
+     * @throws IllegalArgumentException if either is null or blank
      */
     public static String ownerKey(final String key, final String ownerId) {
-        return key + OWNER_MARK + ownerId;
+        // Either one missing composes a key that reads as a real one and drains nobody: a blank owner
+        // gives "<key>/@", which no run consults and an operator takes for a drain in force.
+        return checked(key) + OWNER_MARK + checkedOwner(ownerId);
+    }
+
+    /**
+     * @param ownerId the deployment a per-owner switch is for
+     * @return it, once it is worth composing a key from
+     * @throws IllegalArgumentException if it is null or blank
+     */
+    private static String checkedOwner(final String ownerId) {
+        if (ownerId == null || ownerId.isBlank()) {
+            throw new IllegalArgumentException("ownerId must not be blank");
+        }
+        return ownerId;
     }
 
     /**
